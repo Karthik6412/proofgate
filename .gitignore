@@ -1,0 +1,9 @@
+.venv/
+operations/working.db
+operations/snapshots/
+artifacts/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.env

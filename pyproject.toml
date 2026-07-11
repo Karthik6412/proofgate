@@ -1,0 +1,19 @@
+[project]
+name = "proofgate"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "openai",
+    "python-dotenv",
+    "mcp",
+    "streamlit",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

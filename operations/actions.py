@@ -1,0 +1,113 @@
+"""Dumb Operations mutation and preview logic.
+
+This module is policy-unaware: it does not evaluate intent, risk, proof,
+or workflow budget, and it never returns ALLOW/BLOCK. It only reports and
+performs the authoritative operational blast radius against the shadow
+CRM. preview_delete_users and delete_users share one selection predicate
+(operations.selection.build_predicate) so read and write paths can never
+diverge in what they consider "affected".
+"""
+
+import datetime
+from pathlib import Path
+
+from operations.database import PRISTINE_DB_PATH, WORKING_DB_PATH, get_connection
+from operations.selection import build_predicate, zero_filled_counts
+from proofgate.models import ImpactEnvelope, MutationResult
+from proofgate.selector import compute_selector_hash
+
+
+def _select_environment_counts(
+    conn, inactive_days: int, environment: str | None
+) -> dict[str, int]:
+    clause, params = build_predicate(inactive_days, environment)
+    rows = conn.execute(
+        f"SELECT environment, COUNT(*) AS n FROM users WHERE {clause} GROUP BY environment",
+        params,
+    ).fetchall()
+    return zero_filled_counts(rows)
+
+
+def preview_delete_users(
+    inactive_days: int,
+    environment: str | None,
+    db_path: Path = WORKING_DB_PATH,
+) -> ImpactEnvelope:
+    """Compute the exact affected-row impact for a delete_users call. Read-only."""
+    conn = get_connection(db_path)
+    try:
+        environment_counts = _select_environment_counts(conn, inactive_days, environment)
+    finally:
+        conn.close()
+
+    estimated_count = sum(environment_counts.values())
+    selector_hash = compute_selector_hash(
+        {"inactive_days": inactive_days, "environment": environment}
+    )
+
+    return ImpactEnvelope(
+        tool_name="delete_users",
+        estimated_count=estimated_count,
+        environment_counts=environment_counts,
+        hard_delete=True,
+        reversibility="irreversible_without_snapshot",
+        selector_hash=selector_hash,
+        generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    )
+
+
+def delete_users(
+    inactive_days: int,
+    environment: str | None,
+    db_path: Path = WORKING_DB_PATH,
+) -> MutationResult:
+    """Dumb hard-delete mutation.
+
+    Policy-unaware by design: accepts no ActionContext, rollback proof,
+    policy configuration, or verdict. Selects, counts, and deletes the
+    matching rows inside one transaction using the same predicate as
+    preview_delete_users.
+    """
+    if Path(db_path).resolve() == PRISTINE_DB_PATH.resolve():
+        raise ValueError("Refusing to mutate the pristine database.")
+
+    conn = get_connection(db_path, isolation_level=None)
+    try:
+        clause, params = build_predicate(inactive_days, environment)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            environment_counts = _select_environment_counts(
+                conn, inactive_days, environment
+            )
+            cursor = conn.execute(f"DELETE FROM users WHERE {clause}", params)
+            expected = sum(environment_counts.values())
+            if cursor.rowcount != expected:
+                raise RuntimeError(
+                    f"Selection/delete mismatch: counted {expected}, deleted {cursor.rowcount}"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    return MutationResult(
+        affected_count=sum(environment_counts.values()),
+        production_affected=environment_counts["production"],
+        test_affected=environment_counts["test"],
+    )
+
+
+def count_rows(db_path: Path = WORKING_DB_PATH, environment: str | None = None) -> int:
+    """Count non-deleted rows, optionally filtered by environment. Test/demo helper."""
+    conn = get_connection(db_path)
+    try:
+        query = "SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL"
+        params: list = []
+        if environment is not None:
+            query += " AND environment = ?"
+            params.append(environment)
+        return conn.execute(query, params).fetchone()["n"]
+    finally:
+        conn.close()
