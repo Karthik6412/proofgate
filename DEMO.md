@@ -59,18 +59,62 @@ rejected with a clear error rather than guessed at.
 missing credentials cause an immediate, silent-to-the-user degrade to
 deterministic/cached behavior, logged once to stderr.
 
-**One safety exception, independent of mode:** the Streamlit page's CRAFT
-evidence panel is populated automatically, unconditionally, every time the
-page loads (Streamlit re-executes the whole script on each run). CRAFT's
-OAuth flow opens a real browser window and caches no token across
-processes, so — verified empirically during Slice 20 — restoring true
-live-by-default for *that specific automatic call* would make a fresh
-`streamlit run app.py` attempt a real OAuth popup merely from starting the
-app, if `CRAFT_PROJECT_ID` happens to be configured. `app.py` therefore
-always forces that one call to cached/fallback evidence, in every mode.
+**CRAFT live retrieval is explicit and lazy (Slice 20.1):** the Streamlit
+page's automatic evidence panel is populated on every page load (Streamlit
+re-executes the whole script on each run), which for a fresh process is
+functionally equivalent to "at import." CRAFT's OAuth flow opens a real
+browser window and caches no token across processes, so — verified
+empirically — attempting live CRAFT automatically from that call would
+make a fresh `streamlit run app.py` attempt a real OAuth popup merely from
+starting the app, if `CRAFT_PROJECT_ID` happens to be configured. That
+automatic call therefore always passes `force_fallback=True`
+(`craft.evidence.prepare_craft_evidence`'s new parameter) and is
+*structurally* incapable of attempting live, in every runtime mode — not
+merely configured not to.
+
+> In live mode, ProofGate prefers live CRAFT evidence only after an
+> explicit user request. Page load remains offline-safe and never
+> initiates OAuth.
+
+In `live` mode only, the "CRAFT enterprise context" panel shows one
+explicit **"Fetch live CRAFT evidence"** button. Clicking it calls
+`prepare_craft_evidence` without `force_fallback`, so it genuinely attempts
+live CRAFT if configured. The result (live success, or fallback-after-
+failure) is stored in session state, reused across reruns, and never
+re-fetched automatically — the button disappears once clicked, and no
+refresh action exists in this patch. `fallback`/`reliable_demo` modes
+never show this button and never call live CRAFT. `Reset demo` clears this
+state back to "not yet requested" (it does not and cannot revoke any
+external OAuth token — those live only in the CRAFT client process's
+memory, per `craft/auth.py`, never in Streamlit's session state).
+
 Nebius has no equivalent import-time trigger (it only runs when you click
-a governed action button) and is not restricted this way. See
-`tests/test_app_import.py::test_importing_app_never_attempts_a_live_craft_call_even_with_real_env_credentials`.
+a governed action button) and needed no such restriction in Slice 20. See
+`tests/test_app_import.py::test_importing_app_never_attempts_a_live_craft_call_even_with_real_env_credentials`
+and `tests/test_lazy_craft_ui.py`.
+
+**Exact CRAFT source labels** (`craft_evidence_source_label` in
+`app_logic.py`):
+
+- `Live` — a live fetch just succeeded.
+- `Cached — live fetch not requested` — `live` mode, before the button is
+  clicked.
+- `Cached fallback — configuration unavailable` — fetch requested, but no
+  usable `CRAFT_PROJECT_ID`/live configuration.
+- `Cached fallback — live retrieval failed` — fetch requested and
+  attempted, but failed (timeout, network error, invalid evidence).
+- `Cached — fallback mode` — resolved mode is `fallback`.
+- `Reliable demo evidence` — resolved mode is `reliable_demo`.
+- `Unavailable` — no live evidence and no cache at all.
+
+**MCP and CRAFT:** the MCP gateway (`proofgate/mcp_server.py`) never calls
+CRAFT at all, in any mode — not even for fallback evidence. It never
+imports any `craft.*` module. `guarded_execute`'s audit events for
+MCP-driven calls always have `craft_evidence: null`, honestly reflecting
+that CRAFT was never consulted. Explicit live CRAFT is therefore currently
+a Streamlit-only capability; MCP's stdio process has no way to complete an
+interactive browser OAuth flow, and this patch does not attempt to build
+one.
 
 **Test isolation:** `tests/conftest.py`'s autouse fixtures force
 `PROOFGATE_RUNTIME_MODE=fallback` (plus the legacy flags, plus clearing
@@ -298,11 +342,12 @@ they remain exactly as they were before this slice.
 
 ## Cached CRAFT behavior
 
-The Streamlit page's automatic CRAFT evidence panel always uses
-cached/fallback evidence, in every runtime mode (see "Runtime modes"
-above for why) — no OAuth flow ever runs from merely opening the page.
-The **"CRAFT enterprise context"** panel (near the top of the page, just
-under "User instruction") always shows:
+The Streamlit page's *automatic* CRAFT evidence panel always uses
+cached/fallback evidence on page load, in every runtime mode (see
+"Runtime modes" above for why) — no OAuth flow ever runs from merely
+opening the page. Before clicking "Fetch live CRAFT evidence" (`live`
+mode only; see "Runtime modes"), the **"CRAFT enterprise context"** panel
+(near the top of the page, just under "User instruction") always shows:
 
 - Label: **"Previously retrieved CRAFT evidence"**
 - Mode: **cached**

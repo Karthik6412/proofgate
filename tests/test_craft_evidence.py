@@ -612,6 +612,70 @@ def test_no_real_craft_client_used_by_default():
 
 
 # ---------------------------------------------------------------------------
+# Slice 20.1: force_fallback -- structurally incapable of attempting live,
+# regardless of session_factory or config.live_enabled()/has_project_id().
+# Used by app.py's automatic, ungated page-load evidence call.
+# ---------------------------------------------------------------------------
+
+
+def test_force_fallback_true_never_touches_an_injected_session_factory():
+    session = FakeCraftSession(_default_tool_names(), _default_responses())
+    outcome = prepare_craft_evidence(
+        _fresh_workflow_id(),
+        BROAD_INSTRUCTION,
+        session_factory=_fake_session_factory(session),
+        force_fallback=True,
+    )
+    assert session.calls == []
+    assert outcome.mode != "live"
+
+
+def test_force_fallback_true_ignores_live_configuration(monkeypatch):
+    monkeypatch.setenv("CRAFT_LIVE_ENABLED", "true")
+    monkeypatch.setenv("CRAFT_PROJECT_ID", "dummy-project")
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("force_fallback=True must never reach run_craft_workflow")
+
+    with mock.patch("craft.evidence.run_craft_workflow", _explode):
+        outcome = prepare_craft_evidence(_fresh_workflow_id(), BROAD_INSTRUCTION, force_fallback=True)
+        assert outcome.mode != "live"
+
+
+def test_force_fallback_true_still_returns_cached_evidence_when_available(tmp_path, monkeypatch):
+    cache_path = tmp_path / "cache.json"
+    seed_evidence = {
+        "label": LABEL_LIVE,
+        "mode": "live",
+        "database": "thelook-ecommerce-0f0a359c",
+        "question": BROAD_INSTRUCTION,
+        "generated_sql": "SELECT 1",
+        "result_summary": "Returned 1 row(s).",
+        "result_preview": [],
+        "tool_trace": ["list_tools"],
+        "retrieved_at": "2026-07-11T00:00:00+00:00",
+        "authoritative_for_mutation_impact": False,
+    }
+    cache_path.write_text(json.dumps(seed_evidence))
+    monkeypatch.setenv("CRAFT_CACHE_PATH", str(cache_path))
+
+    outcome = prepare_craft_evidence(_fresh_workflow_id(), BROAD_INSTRUCTION, force_fallback=True)
+
+    assert outcome.mode == "cached"
+    assert outcome.evidence.label == LABEL_CACHED
+    assert outcome.error_summary is None
+
+
+def test_force_fallback_default_is_false_and_preserves_existing_live_behavior():
+    session = FakeCraftSession(_default_tool_names(), _default_responses())
+    outcome = prepare_craft_evidence(
+        _fresh_workflow_id(), BROAD_INSTRUCTION, session_factory=_fake_session_factory(session)
+    )
+    assert outcome.mode == "live"
+    assert session.calls  # the fake session was genuinely used
+
+
+# ---------------------------------------------------------------------------
 # OAuth browser-consent timeout is separate from network/tool timeouts
 # ---------------------------------------------------------------------------
 

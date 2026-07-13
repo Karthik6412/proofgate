@@ -439,3 +439,33 @@ def craft_source_label(mode: str | None, error_summary: str | None = None) -> st
     if mode == "unavailable":
         return "Unavailable"
     return "Unknown"
+
+
+def craft_evidence_source_label(
+    runtime_mode: str,
+    live_requested: bool,
+    mode: str | None,
+    error_summary: str | None = None,
+) -> str:
+    """Honest, mode-aware CRAFT evidence source label (Slice 20.1) for the
+    primary UI's explicit-live-fetch flow. runtime_mode is the resolved
+    RuntimeMode value ("live"/"fallback"/"reliable_demo"); live_requested
+    is whether the user has clicked "Fetch live CRAFT evidence" at least
+    once; mode/error_summary come from whichever real CraftEvidenceOutcome
+    is currently being displayed (the automatic cached one, or the
+    explicit live-fetch one once requested). Never labels cached/fallback
+    evidence as live.
+    """
+    if mode == "live":
+        return "Live"
+    if runtime_mode == "reliable_demo":
+        return "Reliable demo evidence"
+    if mode == "unavailable":
+        return "Unavailable"
+    if error_summary:
+        return "Cached fallback — live retrieval failed"
+    if runtime_mode == "fallback":
+        return "Cached — fallback mode"
+    if runtime_mode == "live" and not live_requested:
+        return "Cached — live fetch not requested"
+    return "Cached fallback — configuration unavailable"

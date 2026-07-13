@@ -875,3 +875,41 @@ def test_mcp_response_never_leaks_secret_values_under_live_failure(monkeypatch):
 
     dumped = json.dumps(result.structuredContent)
     assert "sk-should-never-appear-anywhere" not in dumped
+
+
+# ---------------------------------------------------------------------------
+# Slice 20.1: MCP never touches CRAFT at all (not even fallback-only) --
+# explicit live CRAFT fetch is a Streamlit-only capability. Confirmed here
+# rather than left as an implicit consequence of Slice 19's design.
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_module_never_imports_craft():
+    source = Path(mcp_server.__file__).read_text()
+    tree = ast.parse(source)
+    imported_modules = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.append(node.module)
+    assert not any(name.startswith("craft") for name in imported_modules)
+
+
+def test_mcp_guarded_call_never_invokes_live_craft_workflow(monkeypatch):
+    import craft.client as craft_client_module
+
+    def _explode(*_a, **_k):
+        raise AssertionError("MCP must never attempt live CRAFT")
+
+    monkeypatch.setattr(craft_client_module, "run_craft_workflow", _explode)
+
+    workflow_id = "mcp-no-craft-touch"
+    _clean_state(workflow_id)
+    result = _run(
+        _call(
+            "delete_users",
+            {"instruction": DELETE_INSTRUCTION, "workflow_id": workflow_id, "inactive_days": 90},
+        )
+    )
+    assert result.isError is False

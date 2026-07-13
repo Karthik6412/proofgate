@@ -18,6 +18,7 @@ from app_logic import (
     audit_event_row,
     comparison_markdown_table,
     craft_evidence_display,
+    craft_evidence_source_label,
     craft_source_label,
     craft_status_label,
     ensure_craft_cache_seeded,
@@ -860,3 +861,64 @@ def test_craft_source_label_never_reports_cached_as_live():
     # Regression guard for the core "never mislabel fallback as live" rule.
     assert craft_source_label("cached", "any failure") != "Live"
     assert craft_source_label("cached", None) != "Live"
+
+
+# ---------------------------------------------------------------------------
+# Slice 20.1: craft_evidence_source_label (mode-aware, lazy-live-fetch)
+# ---------------------------------------------------------------------------
+
+
+def test_craft_evidence_source_label_live_success():
+    assert craft_evidence_source_label("live", True, "live", None) == "Live"
+
+
+def test_craft_evidence_source_label_live_mode_before_request():
+    assert craft_evidence_source_label("live", False, "cached", None) == (
+        "Cached — live fetch not requested"
+    )
+
+
+def test_craft_evidence_source_label_live_mode_after_requested_no_config():
+    assert craft_evidence_source_label("live", True, "cached", None) == (
+        "Cached fallback — configuration unavailable"
+    )
+
+
+def test_craft_evidence_source_label_live_mode_after_requested_failure():
+    assert craft_evidence_source_label("live", True, "cached", "[execute_query] TimeoutError") == (
+        "Cached fallback — live retrieval failed"
+    )
+
+
+def test_craft_evidence_source_label_fallback_mode():
+    assert craft_evidence_source_label("fallback", False, "cached", None) == (
+        "Cached — fallback mode"
+    )
+    # live_requested is always False in fallback mode (no button shown),
+    # but the label must not depend on that alone -- fallback mode wins.
+    assert craft_evidence_source_label("fallback", False, "cached", "some failure") == (
+        "Cached fallback — live retrieval failed"
+    )
+
+
+def test_craft_evidence_source_label_reliable_demo_mode():
+    assert craft_evidence_source_label("reliable_demo", False, "cached", None) == (
+        "Reliable demo evidence"
+    )
+    assert craft_evidence_source_label("reliable_demo", False, "unavailable", None) == (
+        "Reliable demo evidence"
+    )
+
+
+def test_craft_evidence_source_label_unavailable():
+    assert craft_evidence_source_label("live", True, "unavailable", None) == "Unavailable"
+
+
+def test_craft_evidence_source_label_never_mislabels_cached_as_live():
+    for runtime_mode in ("live", "fallback", "reliable_demo"):
+        for live_requested in (True, False):
+            for error_summary in (None, "some failure"):
+                assert (
+                    craft_evidence_source_label(runtime_mode, live_requested, "cached", error_summary)
+                    != "Live"
+                )

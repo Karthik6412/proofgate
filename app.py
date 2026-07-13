@@ -16,8 +16,6 @@ inputs. This is a presentation-only reorganization -- every value shown
 still comes from the same real backend calls as before.
 """
 
-import os
-
 import streamlit as st
 
 from app_logic import (
@@ -31,7 +29,7 @@ from app_logic import (
     audit_card_fields,
     comparison_markdown_table,
     craft_evidence_display,
-    craft_source_label,
+    craft_evidence_source_label,
     craft_status_label,
     ensure_craft_cache_seeded,
     find_audit_event_by_id,
@@ -249,6 +247,9 @@ def _init_session_state() -> None:
         "rollback_proof": None,
         "craft_outcome": None,
         "craft_error": None,
+        "craft_live_requested": False,
+        "craft_live_outcome": None,
+        "craft_live_error": None,
         "just_reset": False,
         "deactivate_broad_result": None,
         "deactivate_broad_error": None,
@@ -269,25 +270,27 @@ if not st.session_state.db_initialized:
 # fallback even on a fresh checkout, without ever running live OAuth.
 ensure_craft_cache_seeded()
 
-# Safety exception, independent of the resolved runtime mode: this call
-# runs unconditionally in the script's top-level body every time the page
-# loads (Streamlit re-executes the whole script), which for a fresh
-# process is functionally equivalent to "at import" -- and CRAFT's OAuth
-# (craft/auth.py) has no cross-process token cache, opens a real browser
-# window, and would otherwise fire automatically the first time anyone
-# merely starts the app with real CRAFT credentials configured. That
-# would violate this project's "no network calls / OAuth during import"
-# invariant (verified empirically: with this repo's own .env configured,
-# `import app` in LIVE mode does reach craft.client.run_craft_workflow).
-# So this one automatic call always uses cached/fallback evidence,
-# regardless of PROOFGATE_RUNTIME_MODE -- Nebius has no such import-time
-# trigger (it only runs on an explicit button click below) and is not
-# restricted this way.
-os.environ["CRAFT_LIVE_ENABLED"] = "false"
-
+# Slice 20.1: this automatic call runs unconditionally in the script's
+# top-level body every time the page loads (Streamlit re-executes the
+# whole script), which for a fresh process is functionally equivalent to
+# "at import" -- and CRAFT's OAuth (craft/auth.py) has no cross-process
+# token cache, opens a real browser window, and would otherwise fire
+# automatically the first time anyone merely starts the app with real
+# CRAFT credentials configured. That would violate this project's "no
+# network calls / OAuth during import" invariant (verified empirically:
+# with this repo's own .env configured, this call previously reached
+# craft.client.run_craft_workflow). force_fallback=True makes this call
+# *structurally* incapable of attempting live, regardless of
+# PROOFGATE_RUNTIME_MODE or CRAFT_LIVE_ENABLED/CRAFT_PROJECT_ID -- not
+# merely configured not to. Live CRAFT is instead only ever attempted by
+# the explicit "Fetch live CRAFT evidence" button below. Nebius has no
+# such import-time trigger (it only runs on an explicit governed-action
+# button click) and is not restricted this way.
 if st.session_state.craft_outcome is None and st.session_state.craft_error is None:
     try:
-        st.session_state.craft_outcome = prepare_craft_evidence(WORKFLOW_ID, FIXED_INSTRUCTION)
+        st.session_state.craft_outcome = prepare_craft_evidence(
+            WORKFLOW_ID, FIXED_INSTRUCTION, force_fallback=True
+        )
     except Exception as exc:  # noqa: BLE001 -- show it, never crash the app
         st.session_state.craft_error = str(exc)
 
@@ -324,14 +327,20 @@ if st.session_state.just_reset:
     st.success(RESET_SUCCESS_MESSAGE)
     st.session_state.just_reset = False
 
-craft_mode = st.session_state.craft_outcome.mode if st.session_state.craft_outcome else None
-craft_error_summary = st.session_state.craft_outcome.error_summary if st.session_state.craft_outcome else None
+# Slice 20.1: prefer the explicit live-fetch outcome (once requested) over
+# the automatic always-fallback one, without ever discarding either.
+active_craft_outcome = st.session_state.craft_live_outcome or st.session_state.craft_outcome
+craft_mode = active_craft_outcome.mode if active_craft_outcome else None
+craft_error_summary = active_craft_outcome.error_summary if active_craft_outcome else None
+craft_source = craft_evidence_source_label(
+    _RESOLVED_RUNTIME_MODE, st.session_state.craft_live_requested, craft_mode, craft_error_summary
+)
 status_cols = st.columns(6)
 status_cols[0].caption(f"**Runtime mode:** {mode_label(_RESOLVED_RUNTIME_MODE)}")
 status_cols[1].caption(f"**Operations DB:** {operations_db_status_label(WORKING_DB_PATH)}")
 status_cols[2].caption("**Deterministic policy:** Active")
 status_cols[3].caption("**Audit log:** Active")
-status_cols[4].caption(f"**CRAFT evidence:** {craft_source_label(craft_mode, craft_error_summary)}")
+status_cols[4].caption(f"**CRAFT evidence:** {craft_source}")
 status_cols[5].caption(f"**Nebius extraction:** {nebius_status_label()}")
 
 st.divider()
@@ -348,14 +357,42 @@ st.info(f'"{FIXED_INSTRUCTION}"')
 # ---------------------------------------------------------------------------
 
 with st.expander("CRAFT enterprise context — read-only, never decides ALLOW/BLOCK", expanded=False):
+    # Slice 20.1: the one explicit, user-initiated live CRAFT action. Shown
+    # only in LIVE mode, only before the first request -- never shown (and
+    # never enabled) in FALLBACK/RELIABLE_DEMO, and never re-invoked once
+    # already requested (no automatic retry on rerun).
+    if _RESOLVED_RUNTIME_MODE == "live" and not st.session_state.craft_live_requested:
+        st.caption(
+            "In live mode, ProofGate prefers live CRAFT evidence only after an "
+            "explicit request. Page load remains offline-safe and never "
+            "initiates OAuth."
+        )
+        if st.button("Fetch live CRAFT evidence"):
+            st.session_state.craft_live_requested = True
+            try:
+                st.session_state.craft_live_outcome = prepare_craft_evidence(
+                    WORKFLOW_ID, FIXED_INSTRUCTION
+                )
+            except Exception as exc:  # noqa: BLE001 -- show it, never crash the app
+                st.session_state.craft_live_error = str(exc)
+            # The status row above (and craft_source/active_craft_outcome
+            # computed above it) were already rendered earlier in this same
+            # script pass using the pre-click state -- rerun so the whole
+            # page reflects the fresh result from the top, exactly like the
+            # existing "Reset demo" button does.
+            st.rerun()
+
+    if st.session_state.craft_live_error:
+        st.error(f"Live CRAFT fetch failed: {st.session_state.craft_live_error}")
+
     if st.session_state.craft_error:
         st.error(f"CRAFT evidence unavailable: {st.session_state.craft_error}")
     else:
-        outcome = st.session_state.craft_outcome
-        evidence = craft_evidence_display(outcome.evidence if outcome else None)
+        evidence = craft_evidence_display(active_craft_outcome.evidence if active_craft_outcome else None)
         if evidence is None:
             st.write("No CRAFT evidence is currently available (no live result and no cache).")
         else:
+            st.markdown(f"**CRAFT source:** {craft_source}")
             st.caption("Read-only enterprise context — not authoritative for mutation impact")
             st.write(f"**Label:** {evidence['label']}")
             st.write(f"**Mode:** {evidence['mode']}")

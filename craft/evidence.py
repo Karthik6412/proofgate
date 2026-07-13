@@ -91,18 +91,29 @@ def prepare_craft_evidence(
     question: str = DEMO_COHORT_QUESTION,
     session_factory=None,
     diagnostics: dict | None = None,
+    force_fallback: bool = False,
 ) -> CraftEvidenceOutcome:
     """Attempt the live CRAFT workflow when enabled; fall back to clearly
     labeled cached evidence on failure. Records the outcome in
     WorkflowState by workflow_id. Never called from guarded_delete_users.
+
+    force_fallback (Slice 20.1) unconditionally skips the live branch,
+    regardless of config.live_enabled()/has_project_id() or session_factory.
+    Used for an automatic, ungated call site (e.g. Streamlit's page-load
+    evidence panel) that must be structurally incapable of attempting a
+    live call -- not merely configured not to -- so it can never initiate
+    OAuth no matter what CRAFT_LIVE_ENABLED/CRAFT_PROJECT_ID happen to be
+    set to at that moment. An explicit, user-initiated call (e.g. a
+    "Fetch live CRAFT evidence" button) omits this flag so it can attempt
+    a real live call when configured.
     """
     cache_path = config.cache_path()
     error_summary = None
     if diagnostics is None:
         diagnostics = {}
 
-    should_attempt_live = session_factory is not None or (
-        config.live_enabled() and config.has_project_id()
+    should_attempt_live = not force_fallback and (
+        session_factory is not None or (config.live_enabled() and config.has_project_id())
     )
 
     if should_attempt_live:
