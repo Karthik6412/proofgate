@@ -28,10 +28,13 @@ import streamlit as st
 from app_logic import (
     CORRECTED_INACTIVE_DAYS,
     CORRECTED_MAX_AFFECTED_ROWS,
+    DEACTIVATE_INSTRUCTION,
+    DEACTIVATE_WORKFLOW_ID,
     FIXED_INSTRUCTION,
     RESET_SUCCESS_MESSAGE,
     WORKFLOW_ID,
     audit_card_fields,
+    comparison_markdown_table,
     craft_evidence_display,
     craft_status_label,
     ensure_craft_cache_seeded,
@@ -39,18 +42,22 @@ from app_logic import (
     format_count,
     format_executed,
     latest_event_by_verdict,
+    mutation_verb_label,
     nebius_status_label,
     operations_db_status_label,
+    policy_rule_comparison_rows,
     read_audit_rows,
     recovery_proof_card_fields,
+    recovery_proof_requirement_label,
     reset_demo_state,
+    reset_deactivate_demo_state,
     triggered_rule_rows,
 )
 from craft.evidence import prepare_craft_evidence
 from operations.database import WORKING_DB_PATH, reset_working_db
 from operations.snapshots import create_snapshot
 from proofgate.audit import DEFAULT_AUDIT_PATH
-from proofgate.core import guarded_delete_users
+from proofgate.core import guarded_delete_users, guarded_execute
 from proofgate.models import ActionContext
 
 st.set_page_config(page_title="ProofGate", layout="wide")
@@ -82,6 +89,15 @@ def _action_context() -> ActionContext:
     )
 
 
+def _deactivate_action_context() -> ActionContext:
+    return ActionContext(
+        workflow_id=DEACTIVATE_WORKFLOW_ID,
+        requesting_user="demo-judge",
+        agent_id="demo-agent",
+        original_instruction=DEACTIVATE_INSTRUCTION,
+    )
+
+
 def _render_governance_and_verdict(result, audit_event: dict | None, rollback_proof) -> None:
     """Shared rendering for one governed invocation (unsafe or corrected).
 
@@ -100,6 +116,12 @@ def _render_governance_and_verdict(result, audit_event: dict | None, rollback_pr
     budget_after = (audit_event or {}).get("workflow_budget_after") or {}
     proof_status = (audit_event or {}).get("proof_status") or "MISSING"
     proof_checks = (audit_event or {}).get("proof_checks")
+    # Read directly from the real ImpactEnvelope this specific call
+    # produced -- never hardcoded per tool -- so delete_users (hard_delete
+    # True) keeps its exact existing wording below, and deactivate_users
+    # (hard_delete False) honestly gets its own reversible-action wording.
+    hard_delete = impact.get("hard_delete", True)
+    mutation_verb = mutation_verb_label(hard_delete)
 
     with st.container(border=True):
         info_cols = st.columns([1, 2])
@@ -140,18 +162,30 @@ def _render_governance_and_verdict(result, audit_event: dict | None, rollback_pr
         )
 
         st.caption("RECOVERY PROOF · recoverability evidence — never grants permission by itself")
-        proof_fields = recovery_proof_card_fields(proof_status, rollback_proof, proof_checks)
-        proof_cols = st.columns(2)
-        with proof_cols[0]:
-            st.markdown(f"**Validation status:** {proof_fields['Validation status']}")
-            st.markdown(f"**Snapshot ID:** {proof_fields['Snapshot ID']}")
-            st.markdown(f"**Protected resource:** {proof_fields['Protected resource']}")
-            st.markdown(f"**Maximum affected rows:** {proof_fields['Maximum affected rows']}")
-        with proof_cols[1]:
-            st.markdown(f"**Snapshot exists:** {proof_fields['Snapshot exists']}")
-            st.markdown(f"**Resource matches:** {proof_fields['Resource matches']}")
-            st.markdown(f"**Selector hash matches:** {proof_fields['Selector hash matches']}")
-            st.markdown(f"**Count within approved maximum:** {proof_fields['Count within approved maximum']}")
+        if hard_delete:
+            proof_fields = recovery_proof_card_fields(proof_status, rollback_proof, proof_checks)
+            proof_cols = st.columns(2)
+            with proof_cols[0]:
+                st.markdown(f"**Validation status:** {proof_fields['Validation status']}")
+                st.markdown(f"**Snapshot ID:** {proof_fields['Snapshot ID']}")
+                st.markdown(f"**Protected resource:** {proof_fields['Protected resource']}")
+                st.markdown(f"**Maximum affected rows:** {proof_fields['Maximum affected rows']}")
+            with proof_cols[1]:
+                st.markdown(f"**Snapshot exists:** {proof_fields['Snapshot exists']}")
+                st.markdown(f"**Resource matches:** {proof_fields['Resource matches']}")
+                st.markdown(f"**Selector hash matches:** {proof_fields['Selector hash matches']}")
+                st.markdown(f"**Count within approved maximum:** {proof_fields['Count within approved maximum']}")
+        else:
+            # Reversible action: no proof was supplied and none was
+            # required (RULE_RECOVERY_PROOF never applies to hard_delete
+            # False). This is not an error -- the raw proof_status is still
+            # shown verbatim, just in a technical expander rather than as
+            # a headline "MISSING" that would misleadingly read as a fault.
+            st.markdown(
+                f"**Recovery proof:** {recovery_proof_requirement_label(hard_delete, proof_status)}"
+            )
+            with st.expander("Technical details (raw proof status)", expanded=False):
+                st.json({"proof_status": proof_status})
 
         if rollback_proof is not None:
             with st.expander("Technical details (raw proof)", expanded=False):
@@ -174,9 +208,12 @@ def _render_governance_and_verdict(result, audit_event: dict | None, rollback_pr
             st.divider()
             st.caption("EXECUTION RESULT")
             exec_cols = st.columns(3)
-            exec_cols[0].metric("Test users deleted", format_count(mutation_result.get("test_affected")))
+            exec_cols[0].metric(
+                f"Test users {mutation_verb}", format_count(mutation_result.get("test_affected"))
+            )
             exec_cols[1].metric(
-                "Production users deleted", format_count(mutation_result.get("production_affected"))
+                f"Production users {mutation_verb}",
+                format_count(mutation_result.get("production_affected")),
             )
             rows_mutated = budget_after.get("rows_mutated")
             max_rows = budget_after.get("max_rows", 100)
@@ -202,6 +239,10 @@ def _init_session_state() -> None:
         "craft_outcome": None,
         "craft_error": None,
         "just_reset": False,
+        "deactivate_broad_result": None,
+        "deactivate_broad_error": None,
+        "deactivate_corrected_result": None,
+        "deactivate_corrected_error": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -231,6 +272,7 @@ with st.sidebar:
     st.markdown("### Demo controls")
     if st.button("Reset demo", type="secondary"):
         reset_demo_state(WORKFLOW_ID)
+        reset_deactivate_demo_state(DEACTIVATE_WORKFLOW_ID)
         st.session_state.clear()
         st.session_state["just_reset"] = True
         st.rerun()
@@ -382,6 +424,161 @@ else:
         _render_governance_and_verdict(
             corrected, audit_event, rollback_proof=st.session_state.rollback_proof
         )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Same engine, a different tool -- deactivate_users second-tool
+# demonstration (Slice 18). Same shared guarded_execute pipeline as
+# delete_users above, called with a different registered tool_name, to
+# make ProofGate's genericity visible without opening any expander. This
+# section is fixed and deliberate: exactly two tools, no generic picker.
+# ---------------------------------------------------------------------------
+
+st.markdown("## Same engine, a different tool")
+st.caption(
+    "ProofGate evaluates both actions through the same guarded pipeline. "
+    "The reversible action does not require snapshot proof."
+)
+st.caption(
+    "This demonstration uses its own workflow budget "
+    f"(`{DEACTIVATE_WORKFLOW_ID}`), separate from the delete demonstration's "
+    f"workflow budget (`{WORKFLOW_ID}`), so the two corrected mutations can "
+    "be compared independently instead of sharing one combined budget."
+)
+
+if st.session_state.corrected_result is not None:
+    st.warning(
+        'The delete demonstration\'s "Apply verified repair" above has already run '
+        "and permanently removed the 92 test rows both demonstrations select from "
+        "the one shared database. This section's counts will now show 0 affected "
+        'test rows. Click "Reset demo" and complete this entire section (both '
+        "buttons below) *before* applying the delete demonstration's verified "
+        "repair, to see both demonstrations at 92."
+    )
+else:
+    st.caption(
+        "Both demonstrations select the same 92 test rows from one shared "
+        "database. Complete this entire section (both buttons below) before "
+        "applying the delete demonstration's verified repair above, so both "
+        "corrected actions affect 92 rows independently."
+    )
+
+st.markdown("### Proposed tool invocation (reversible)")
+st.code("deactivate_users(inactive_days=90)", language="python")
+
+if st.button("Run reversible broad call", type="primary"):
+    if (
+        st.session_state.deactivate_broad_result is None
+        and st.session_state.deactivate_broad_error is None
+    ):
+        try:
+            st.session_state.deactivate_broad_result = guarded_execute(
+                tool_name="deactivate_users",
+                action_context=_deactivate_action_context(),
+                arguments={"inactive_days": 90, "environment": None},
+                rollback_proof=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.session_state.deactivate_broad_error = str(exc)
+
+if st.session_state.deactivate_broad_error:
+    st.error(
+        f"Backend error while evaluating the reversible broad call: "
+        f"{st.session_state.deactivate_broad_error}"
+    )
+
+if st.session_state.deactivate_broad_result is not None:
+    deactivate_broad = st.session_state.deactivate_broad_result
+    deactivate_broad_audit = find_audit_event_by_id(
+        DEFAULT_AUDIT_PATH, deactivate_broad.audit_event_id
+    )
+    _render_governance_and_verdict(deactivate_broad, deactivate_broad_audit, rollback_proof=None)
+
+    st.markdown("#### Same rules, same guarded pipeline — different recovery requirement")
+    if st.session_state.unsafe_result is not None:
+        comparison_rows = policy_rule_comparison_rows(
+            delete_triggered_rule_ids={
+                rule.rule_id for rule in st.session_state.unsafe_result.triggered_rules
+            },
+            deactivate_triggered_rule_ids={
+                rule.rule_id for rule in deactivate_broad.triggered_rules
+            },
+            delete_verdict=st.session_state.unsafe_result.verdict,
+            deactivate_verdict=deactivate_broad.verdict,
+        )
+        st.markdown(comparison_markdown_table(comparison_rows))
+        st.caption(
+            "Same rules, same guarded pipeline—different recovery requirement "
+            "because deactivation is reversible."
+        )
+    else:
+        st.caption("Run the unsafe delete action above to see the full side-by-side comparison.")
+
+st.divider()
+
+st.markdown("### Corrected tool invocation (reversible)")
+
+if st.session_state.deactivate_broad_result is None:
+    st.write("Run the reversible broad call first.")
+else:
+    st.info(
+        'Same public tool `deactivate_users` — this call adds `environment="test"`. '
+        "No rollback proof is required because this action is reversible."
+    )
+    st.code(
+        'deactivate_users(\n'
+        f'    inactive_days={CORRECTED_INACTIVE_DAYS},\n'
+        '    environment="test",\n'
+        ')',
+        language="python",
+    )
+
+    if st.button("Apply reversible repair", type="primary"):
+        if (
+            st.session_state.deactivate_corrected_result is None
+            and st.session_state.deactivate_corrected_error is None
+        ):
+            try:
+                st.session_state.deactivate_corrected_result = guarded_execute(
+                    tool_name="deactivate_users",
+                    action_context=_deactivate_action_context(),
+                    arguments={"inactive_days": CORRECTED_INACTIVE_DAYS, "environment": "test"},
+                    rollback_proof=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.deactivate_corrected_error = str(exc)
+
+    if st.session_state.deactivate_corrected_error:
+        st.error(
+            f"Backend error while applying the reversible repair: "
+            f"{st.session_state.deactivate_corrected_error}"
+        )
+
+    if st.session_state.deactivate_corrected_result is not None:
+        deactivate_corrected = st.session_state.deactivate_corrected_result
+        deactivate_corrected_audit = find_audit_event_by_id(
+            DEFAULT_AUDIT_PATH, deactivate_corrected.audit_event_id
+        )
+        _render_governance_and_verdict(
+            deactivate_corrected, deactivate_corrected_audit, rollback_proof=None
+        )
+
+with st.expander("Deactivate audit trail", expanded=False):
+    deactivate_rows = read_audit_rows(DEFAULT_AUDIT_PATH, workflow_id=DEACTIVATE_WORKFLOW_ID)
+    if not deactivate_rows:
+        st.write("No audit events recorded yet.")
+    else:
+        deactivate_block_row = latest_event_by_verdict(deactivate_rows, "BLOCK")
+        deactivate_allow_row = latest_event_by_verdict(deactivate_rows, "ALLOW")
+
+        deactivate_audit_cols = st.columns(2)
+        with deactivate_audit_cols[0]:
+            st.markdown("**BLOCK event**")
+            st.json(audit_card_fields(deactivate_block_row))
+        with deactivate_audit_cols[1]:
+            st.markdown("**ALLOW event**")
+            st.json(audit_card_fields(deactivate_allow_row))
 
 st.divider()
 

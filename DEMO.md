@@ -23,7 +23,7 @@ Opens at `http://localhost:8501`.
   on first launch if that cache file doesn't already exist.
 - No login, no deployment, no external services required to demo locally.
 
-## Page layout (Slice 15 redesign)
+## Page layout (Slice 15 redesign, extended in Slice 18)
 
 The page is organized around the actual governance pipeline, top to bottom:
 
@@ -43,6 +43,18 @@ Corrected tool invocation →  [Apply verified repair]  →  same governance car
         → VERDICT banner (dominant) → execution result → POSTCONDITION banner (dominant)
         ↓
 Audit trail (collapsed — BLOCK event card + ALLOW event card)
+        ↓
+"Same engine, a different tool" — deactivate_users second-tool demonstration
+        (Slice 18): same governance card renderer, run through
+        guarded_execute("deactivate_users", ...) instead of
+        guarded_delete_users(...):
+        Proposed tool invocation (reversible) → [Run reversible broad call]
+        → governance card (BLOCK, RULE_INTENT_BOUNDARY + RULE_WORKFLOW_BUDGET only)
+        → side-by-side rule comparison table (delete vs deactivate)
+        → Corrected tool invocation (reversible) → [Apply reversible repair]
+        → governance card (ALLOW, "Recovery proof: Not required for this
+          reversible action", no snapshot) → execution result → POSTCONDITION
+        → Deactivate audit trail (collapsed)
 ```
 
 This is a presentation-only reorganization: the **same** real backend calls,
@@ -51,7 +63,9 @@ deterministic-policy verdict banner (BLOCK/ALLOW) is the single largest,
 most visually dominant element on the page; CRAFT and Nebius are compact,
 muted, and collapsed/subordinate; Operations DB and Recovery Proof sit at an
 intermediate visual weight — real authoritative inputs, but not the
-decision itself.
+decision itself. The Slice 18 section below reuses this exact same
+governance-card renderer for a second, reversible tool — it does not
+introduce a second rendering system.
 
 ## Reset procedure
 
@@ -63,10 +77,14 @@ page reload if the backend has already been mutated by an earlier session.
 "Reset demo" does all of the following, in order:
 
 1. Reseeds `operations/working.db` from `operations/pristine.db` (exact
-   deterministic counts).
-2. Zeroes the ProofGate workflow budget for this demo's workflow.
-3. Clears the JSONL audit log (`artifacts/audit.jsonl`).
-4. Clears all Streamlit session state (results, snapshot proof, errors).
+   deterministic counts) — this also restores any rows deactivated during
+   the second-tool demonstration back to their seeded, non-deactivated state.
+2. Zeroes the ProofGate workflow budget for **both** demo workflows:
+   `demo-workflow` (delete) and `deactivate-demo-workflow` (deactivate).
+3. Clears the JSONL audit log (`artifacts/audit.jsonl`) — shared by both
+   demonstrations, so this clears both.
+4. Clears all Streamlit session state (results, snapshot proof, errors, for
+   both demonstrations).
 5. Shows: **"Demo reset. Database reseeded and workflow state cleared."**
 
 After reset, the corrected-action section is disabled again until the
@@ -74,7 +92,22 @@ unsafe action is run once — this is by design, not a bug. The interaction
 order is unchanged: **Reset Demo → Run Unsafe Agent Action → Apply Verified
 Repair**.
 
-## Exact 2–3 minute click path
+## Exact click path
+
+**Important — click order across the two demonstrations:** both the delete
+and deactivate demonstrations deliberately select the exact same 92 test
+rows from the one shared `operations/working.db` (both use
+`inactive_days=90, environment="test"`, to make the same-selector /
+same-policy / different-reversibility comparison honest). `delete_users`
+performs a real hard `DELETE`; `deactivate_users` only sets
+`status='deactivated'` and `delete_users`'s selection predicate never
+inspects `status`. So **"Apply reversible repair" must be clicked before
+"Apply verified repair."** If "Apply verified repair" runs first, it
+permanently removes those 92 rows and the deactivate demonstration will
+show 0 affected instead of 92 (the app displays a warning if you do this
+out of order — click "Reset demo" and redo the steps in the order below).
+Each demonstration's own internal order (broad/unsafe → corrected/repair)
+is unaffected; only the interleaving between the two sections matters.
 
 1. Click **"Reset demo"** (sidebar). Confirm the green success message.
 2. Under **"Proposed tool invocation,"** click **"Run unsafe agent action"**.
@@ -96,10 +129,36 @@ Repair**.
      an em dash (nothing to validate yet).
    - **Structured repair instructions** (JSON): the corrected call
      (`environment="test"`, `next_step: create_snapshot`).
-3. Under **"Corrected tool invocation,"** read the callout — *"Same public
-   tool `delete_users` — this call adds `environment=\"test\"` and a
-   verified rollback proof"* — then click **"Apply verified repair"**.
-   The same governance card renders again, this time:
+3. Scroll down to **"Same engine, a different tool."** Under **"Proposed
+   tool invocation (reversible),"** click **"Run reversible broad call"**.
+   The same governance card renders for `deactivate_users`:
+   - **Operations DB**: Executed **No**, Total affected **10,073**,
+     Production affected **9,981**, Test affected **92** — identical counts
+     to step 2, because both tools share the same selector.
+   - **Deterministic policy**: exactly two triggered rules
+     (`RULE_INTENT_BOUNDARY`, `RULE_WORKFLOW_BUDGET`) — **no**
+     `RULE_RECOVERY_PROOF` — immediately followed by the large **BLOCK**
+     verdict banner.
+   - **Recovery proof**: *"Not required for this reversible action"*
+     (not "MISSING" presented as an error) — a technical expander below
+     still shows the raw `proof_status: MISSING` for anyone who wants it.
+   - A compact **side-by-side rule comparison table** (delete vs
+     deactivate) and the callout: *"Same rules, same guarded
+     pipeline—different recovery requirement because deactivation is
+     reversible."*
+4. Under **"Corrected tool invocation (reversible),"** click **"Apply
+   reversible repair"**. The governance card renders again:
+   - No triggered rules, followed by the large **ALLOW** verdict banner.
+   - Recovery proof: still *"Not required for this reversible action"* —
+     no snapshot was created for this call.
+   - **Execution result**: Test users deactivated **92**, Production
+     users deactivated **0**, Workflow budget **92 / 100** (this
+     demonstration's own separate `deactivate-demo-workflow` budget).
+   - The large **VERIFIED** postcondition banner.
+5. Now go back up and, under **"Corrected tool invocation,"** read the
+   callout — *"Same public tool `delete_users` — this call adds
+   `environment=\"test\"` and a verified rollback proof"* — then click
+   **"Apply verified repair"**. The same governance card renders again:
    - Nebius / Operations DB reflect the corrected call (reduced blast
      radius: only the 92 test rows).
    - No triggered rules, followed by the large **ALLOW** verdict banner.
@@ -107,15 +166,18 @@ Repair**.
      protected resource `users`, maximum affected rows **92**, and all
      four checks marked **✓**.
    - **Execution result**: Test users deleted **92**, Production users
-     deleted **0**, Workflow budget **92 / 100**.
+     deleted **0**, Workflow budget **92 / 100** (this demonstration's own
+     separate `demo-workflow` budget).
    - The large **VERIFIED** postcondition banner.
    - (Optional) expand **"Technical details (raw proof)"** for the exact
      `snapshot_id` / `selector_hash` / `max_affected_rows` JSON.
-4. (Optional, if a judge asks) Expand **"CRAFT enterprise context"** —
+6. (Optional, if a judge asks) Expand **"CRAFT enterprise context"** —
    shows label, cached mode, cohort question, generated SQL, result
    summary, tool trace, and the read-only/non-authoritative disclaimer.
-5. (Optional) Expand **"Audit trail"** — shows both the BLOCK and ALLOW
-   audit event cards with matching counts, side by side.
+7. (Optional) Expand **"Audit trail"** — shows both the BLOCK and ALLOW
+   audit event cards for the delete demonstration, side by side. Expand
+   **"Deactivate audit trail"** for the same, for the deactivate
+   demonstration.
 
 ## Expected counts and verdicts (exact — unchanged by the redesign)
 
@@ -123,6 +185,39 @@ Repair**.
 |---|---|---|---|---|---|---|---|
 | Unsafe (`environment=None`) | BLOCK | No | 10,073 | 9,981 | 92 | 0 / 100 | — |
 | Corrected (`environment="test"`) | ALLOW | Yes | — | 0 | 92 | 92 / 100 | VERIFIED |
+
+## Same engine, a different tool: deactivate_users (Slice 18)
+
+`deactivate_users` is registered through the same `guarded_execute(...)`
+pipeline as `delete_users`, and evaluated by the exact same four
+deterministic policy rules — the different outcome below comes entirely
+from `deactivate_users` being a reversible action (`hard_delete=False`),
+not from any tool-specific branch in the policy engine.
+
+### Broad reversible call (`environment=None`)
+
+- Verdict: **BLOCK**
+- Total affected: **10,073**, Production affected: **9,981**, Test
+  affected: **92** — identical to the broad delete call (same selector).
+- Triggered rules exactly:
+  - `RULE_INTENT_BOUNDARY`
+  - `RULE_WORKFLOW_BUDGET`
+- `RULE_RECOVERY_PROOF` does **not** trigger, because the action is
+  reversible.
+
+### Corrected reversible call (`environment="test"`)
+
+- Verdict: **ALLOW**
+- Test affected: **92**, Production affected: **0**
+- No rollback proof is required or supplied, and no snapshot is created.
+- Postcondition: **VERIFIED**
+- Workflow budget: **92 / 100** — on its own separate
+  `deactivate-demo-workflow` identity, isolated from the delete
+  demonstration's `demo-workflow` budget so the two 92-row mutations never
+  combine into one 184-row total.
+
+Do not change the existing delete demonstration's expected values above —
+they remain exactly as they were before this slice.
 
 ## Cached CRAFT behavior
 

@@ -13,8 +13,10 @@ import json
 from pathlib import Path
 
 from app_logic import (
+    DEACTIVATE_WORKFLOW_ID,
     audit_card_fields,
     audit_event_row,
+    comparison_markdown_table,
     craft_evidence_display,
     craft_status_label,
     ensure_craft_cache_seeded,
@@ -22,17 +24,21 @@ from app_logic import (
     format_count,
     format_executed,
     latest_event_by_verdict,
+    mutation_verb_label,
     nebius_status_label,
     operations_db_status_label,
+    policy_rule_comparison_rows,
     read_audit_rows,
     recovery_proof_card_fields,
+    recovery_proof_requirement_label,
+    reset_deactivate_demo_state,
     reset_demo_state,
     triggered_rule_rows,
 )
 from operations.actions import count_rows, preview_delete_users
 from operations.database import WORKING_DB_PATH
 from proofgate.budgets import get_workflow_budget
-from proofgate.core import guarded_delete_users
+from proofgate.core import guarded_delete_users, guarded_execute
 from proofgate.models import ActionContext, CraftEvidence, RollbackProof, TriggeredRule
 
 WORKFLOW_ID = "test-demo-workflow"
@@ -601,3 +607,201 @@ def test_recovery_proof_card_fields_returns_only_plain_strings():
     )
     fields = recovery_proof_card_fields("VALID", proof, {"snapshot_exists": True})
     assert all(isinstance(v, str) for v in fields.values())
+
+
+# ---------------------------------------------------------------------------
+# Slice 18: deactivate_users second-tool demonstration presentation helpers
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_verb_label_hard_delete_true_is_deleted():
+    assert mutation_verb_label(True) == "deleted"
+
+
+def test_mutation_verb_label_hard_delete_false_is_deactivated():
+    assert mutation_verb_label(False) == "deactivated"
+
+
+def test_recovery_proof_requirement_label_reversible_missing_is_not_required():
+    assert (
+        recovery_proof_requirement_label(hard_delete=False, proof_status="MISSING")
+        == "Not required for this reversible action"
+    )
+
+
+def test_recovery_proof_requirement_label_hard_delete_falls_back_to_raw_status():
+    # hard_delete=True is the existing delete_users case -- this helper is
+    # never even consulted for it in app.py, but must not silently rewrite
+    # the raw status if it ever were.
+    assert recovery_proof_requirement_label(hard_delete=True, proof_status="MISSING") == "MISSING"
+    assert recovery_proof_requirement_label(hard_delete=True, proof_status="VALID") == "VALID"
+
+
+def test_recovery_proof_requirement_label_reversible_non_missing_falls_back_to_raw_status():
+    # This fixed demo never actually produces VALID/INVALID for a
+    # reversible action (no proof is ever supplied to it), but the helper
+    # must not silently invent a "not required" label for statuses it
+    # doesn't specifically know how to interpret.
+    assert recovery_proof_requirement_label(hard_delete=False, proof_status="VALID") == "VALID"
+    assert recovery_proof_requirement_label(hard_delete=False, proof_status="INVALID") == "INVALID"
+
+
+def test_policy_rule_comparison_rows_matches_the_documented_broad_call_outcome():
+    rows = policy_rule_comparison_rows(
+        delete_triggered_rule_ids={"RULE_INTENT_BOUNDARY", "RULE_RECOVERY_PROOF", "RULE_WORKFLOW_BUDGET"},
+        deactivate_triggered_rule_ids={"RULE_INTENT_BOUNDARY", "RULE_WORKFLOW_BUDGET"},
+        delete_verdict="BLOCK",
+        deactivate_verdict="BLOCK",
+    )
+    assert rows == [
+        {
+            "Policy rule": "RULE_INTENT_BOUNDARY",
+            "Delete users": "Triggered",
+            "Deactivate users": "Triggered",
+        },
+        {
+            "Policy rule": "RULE_RECOVERY_PROOF",
+            "Delete users": "Triggered",
+            "Deactivate users": "Not triggered",
+        },
+        {
+            "Policy rule": "RULE_WORKFLOW_BUDGET",
+            "Delete users": "Triggered",
+            "Deactivate users": "Triggered",
+        },
+        {"Policy rule": "Verdict", "Delete users": "BLOCK", "Deactivate users": "BLOCK"},
+    ]
+
+
+def test_policy_rule_comparison_rows_handles_no_triggered_rules():
+    rows = policy_rule_comparison_rows(
+        delete_triggered_rule_ids=set(),
+        deactivate_triggered_rule_ids=set(),
+        delete_verdict="ALLOW",
+        deactivate_verdict="ALLOW",
+    )
+    for row in rows[:-1]:
+        assert row["Delete users"] == "Not triggered"
+        assert row["Deactivate users"] == "Not triggered"
+    assert rows[-1] == {"Policy rule": "Verdict", "Delete users": "ALLOW", "Deactivate users": "ALLOW"}
+
+
+def test_comparison_markdown_table_builds_a_well_formed_markdown_table():
+    rows = [
+        {"Policy rule": "RULE_INTENT_BOUNDARY", "Delete users": "Triggered", "Deactivate users": "Triggered"},
+        {"Policy rule": "Verdict", "Delete users": "BLOCK", "Deactivate users": "BLOCK"},
+    ]
+    table = comparison_markdown_table(rows)
+    lines = table.splitlines()
+    assert lines[0] == "| Policy rule | Delete users | Deactivate users |"
+    assert lines[1] == "| --- | --- | --- |"
+    assert lines[2] == "| RULE_INTENT_BOUNDARY | Triggered | Triggered |"
+    assert lines[3] == "| Verdict | BLOCK | BLOCK |"
+
+
+def test_comparison_markdown_table_empty_rows_returns_empty_string():
+    assert comparison_markdown_table([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# reset_deactivate_demo_state
+# ---------------------------------------------------------------------------
+
+
+def _deactivate_action_context() -> ActionContext:
+    return ActionContext(
+        workflow_id=DEACTIVATE_WORKFLOW_ID,
+        requesting_user="tester",
+        agent_id="tester-agent",
+        original_instruction="Deactivate inactive test accounts that have not logged in for 90 days.",
+    )
+
+
+def test_reset_deactivate_demo_state_resets_only_its_own_workflow_budget(monkeypatch, tmp_path):
+    import proofgate.audit as audit_module
+
+    monkeypatch.setattr(audit_module, "DEFAULT_AUDIT_PATH", tmp_path / "audit.jsonl")
+
+    guarded_execute(
+        tool_name="deactivate_users",
+        action_context=_deactivate_action_context(),
+        arguments={"inactive_days": 90, "environment": "test"},
+        rollback_proof=None,
+    )
+    assert get_workflow_budget(DEACTIVATE_WORKFLOW_ID).rows_mutated == 92
+
+    reset_deactivate_demo_state(DEACTIVATE_WORKFLOW_ID)
+
+    assert get_workflow_budget(DEACTIVATE_WORKFLOW_ID).rows_mutated == 0
+
+
+# ---------------------------------------------------------------------------
+# Workflow-budget isolation between the two demonstrations (real backend,
+# no fabricated/locally-computed values)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_and_deactivate_corrected_workflows_are_isolated_and_both_report_92(
+    monkeypatch, tmp_path
+):
+    """Both demonstrations share one working database and target the exact
+    same selector (inactive_days=90, environment="test") on purpose -- so
+    the two corrected (mutating) actions must run deactivate-before-delete,
+    not delete-before-deactivate, to both affect exactly 92 rows:
+
+    - deactivate_users only sets status='deactivated' -- the 92 rows still
+      exist afterward, still matching delete_users' predicate (which never
+      inspects status).
+    - delete_users performs a real hard DELETE -- if it ran first, those
+      same 92 rows would be physically gone, and deactivate_users' preview
+      would find 0 eligible rows instead of 92.
+
+    Verified empirically before writing this test: delete-then-deactivate
+    leaves deactivate_users with 0 eligible rows. This is why DEMO.md and
+    app.py's second section both document the deactivate-before-delete
+    corrected-call order, even though the delete section appears first on
+    the page and its own internal click order (reset -> unsafe -> repair)
+    is otherwise unchanged.
+    """
+    import proofgate.audit as audit_module
+
+    monkeypatch.setattr(audit_module, "DEFAULT_AUDIT_PATH", tmp_path / "audit.jsonl")
+
+    reset_demo_state(WORKFLOW_ID)
+    reset_deactivate_demo_state(DEACTIVATE_WORKFLOW_ID)
+
+    deactivate_result = guarded_execute(
+        tool_name="deactivate_users",
+        action_context=_deactivate_action_context(),
+        arguments={"inactive_days": 90, "environment": "test"},
+        rollback_proof=None,
+    )
+    assert deactivate_result.verdict == "ALLOW"
+
+    from operations.snapshots import create_snapshot
+
+    proof = create_snapshot(
+        resource="users", inactive_days=90, environment="test", max_affected_rows=92
+    )
+    delete_result = guarded_delete_users(
+        action_context=_action_context(),
+        inactive_days=90,
+        environment="test",
+        rollback_proof=proof,
+    )
+    assert delete_result.verdict == "ALLOW"
+
+    delete_budget = get_workflow_budget(WORKFLOW_ID)
+    deactivate_budget = get_workflow_budget(DEACTIVATE_WORKFLOW_ID)
+
+    assert delete_budget.rows_mutated == 92
+    assert delete_budget.max_rows == 100
+    assert deactivate_budget.rows_mutated == 92
+    assert deactivate_budget.max_rows == 100
+    # Isolation: neither workflow's budget reflects the other's mutation.
+    assert delete_budget.workflow_id != deactivate_budget.workflow_id
+
+    reset_demo_state(WORKFLOW_ID)
+    reset_deactivate_demo_state(DEACTIVATE_WORKFLOW_ID)
+    assert get_workflow_budget(WORKFLOW_ID).rows_mutated == 0
+    assert get_workflow_budget(DEACTIVATE_WORKFLOW_ID).rows_mutated == 0

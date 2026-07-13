@@ -20,6 +20,13 @@ from proofgate.models import CraftEvidence, RollbackProof, TriggeredRule
 FIXED_INSTRUCTION = "Clean up inactive test accounts that have not logged in for 90 days."
 WORKFLOW_ID = "demo-workflow"
 
+# Slice 18: deactivate_users second-tool demonstration. Its own instruction
+# and workflow_id -- kept entirely separate from the delete demonstration's
+# WORKFLOW_ID so the two corrected mutations (92 rows each) never share one
+# combined workflow budget (see reset_deactivate_demo_state below).
+DEACTIVATE_INSTRUCTION = "Deactivate inactive test accounts that have not logged in for 90 days."
+DEACTIVATE_WORKFLOW_ID = "deactivate-demo-workflow"
+
 # Fixed for this deterministic demo: the corrected call's real test-user
 # count under the seeded/reset database.
 CORRECTED_INACTIVE_DAYS = 90
@@ -164,6 +171,19 @@ def reset_demo_state(workflow_id: str = WORKFLOW_ID) -> None:
     reset_audit_log()
 
 
+def reset_deactivate_demo_state(workflow_id: str = DEACTIVATE_WORKFLOW_ID) -> None:
+    """Reset only the deactivate-demo workflow's ProofGate runtime state.
+
+    The working database and audit log are shared by both demonstrations
+    and are already fully reset once by reset_demo_state (deactivated rows
+    revert to their seeded status on a working-db copy-from-pristine, and
+    the audit log is a single file covering every workflow_id) -- this only
+    needs to clear the second workflow's separate in-memory budget/state
+    so both corrected demonstrations can be re-run from a clean 0/100.
+    """
+    reset_workflow_state(workflow_id)
+
+
 def ensure_craft_cache_seeded(
     seed_path: Path = CRAFT_EVIDENCE_SEED_PATH, cache_path: Path | None = None
 ) -> bool:
@@ -291,3 +311,89 @@ def nebius_status_label() -> str:
     if nebius_client.live_enabled() and nebius_client.has_api_key():
         return "Live (configured)"
     return "Fallback (deterministic)"
+
+
+# ---------------------------------------------------------------------------
+# Slice 18: deactivate_users second-tool demonstration presentation helpers.
+# Plain functions only -- no Streamlit import, no UI rendering -- so the
+# genericity comparison logic is independently unit-testable exactly like
+# the helpers above.
+# ---------------------------------------------------------------------------
+
+
+def mutation_verb_label(hard_delete: bool) -> str:
+    """Honest past-tense verb for the execution-result metric labels:
+    "deleted" for a hard-delete tool, "deactivated" for a reversible one.
+    hard_delete is read directly from the real ImpactEnvelope recorded in
+    the audit event -- never hardcoded per tool -- so this always reflects
+    what the backend actually reported for that specific call."""
+    return "deleted" if hard_delete else "deactivated"
+
+
+def recovery_proof_requirement_label(hard_delete: bool, proof_status: str) -> str:
+    """Honest primary-UI label for the recovery-proof section.
+
+    A reversible action (hard_delete=False) with no proof supplied has
+    proof_status=="MISSING" purely because no RollbackProof object was
+    passed in -- RULE_RECOVERY_PROOF never applies to it in the first
+    place, so this is not an error or a missing requirement and must not
+    be phrased as one. Any other combination this fixed two-tool demo
+    doesn't actually produce falls back to the raw proof_status verbatim,
+    so nothing is ever silently hidden or invented.
+    """
+    if not hard_delete and proof_status == "MISSING":
+        return "Not required for this reversible action"
+    return proof_status
+
+
+_COMPARISON_RULE_IDS = ("RULE_INTENT_BOUNDARY", "RULE_RECOVERY_PROOF", "RULE_WORKFLOW_BUDGET")
+
+
+def policy_rule_comparison_rows(
+    delete_triggered_rule_ids: set[str],
+    deactivate_triggered_rule_ids: set[str],
+    delete_verdict: str,
+    deactivate_verdict: str,
+) -> list[dict[str, str]]:
+    """Table-ready rows for the fixed delete_users vs deactivate_users
+    policy-rule comparison (Slice 18, Part E). This is a deliberate,
+    hardcoded two-tool comparison -- not a generic N-tool table -- built
+    entirely from rule IDs/verdicts the caller already obtained from real
+    EnforcementResults, never recomputed or guessed here.
+    """
+    rows = [
+        {
+            "Policy rule": rule_id,
+            "Delete users": "Triggered" if rule_id in delete_triggered_rule_ids else "Not triggered",
+            "Deactivate users": "Triggered" if rule_id in deactivate_triggered_rule_ids else "Not triggered",
+        }
+        for rule_id in _COMPARISON_RULE_IDS
+    ]
+    rows.append(
+        {
+            "Policy rule": "Verdict",
+            "Delete users": delete_verdict,
+            "Deactivate users": deactivate_verdict,
+        }
+    )
+    return rows
+
+
+def comparison_markdown_table(rows: list[dict[str, str]]) -> str:
+    """Render policy_rule_comparison_rows as a plain Markdown table string.
+
+    Deliberately never st.table/st.dataframe -- both were removed
+    repo-wide after a PyArrow segfault (see app.py's rendering functions);
+    a Markdown table string has zero PyArrow dependency and renders with a
+    plain st.markdown call.
+    """
+    if not rows:
+        return ""
+    headers = list(rows[0].keys())
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
+    return "\n".join(lines)
