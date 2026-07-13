@@ -99,6 +99,104 @@ def delete_users(
     )
 
 
+def _select_deactivation_environment_counts(
+    conn, inactive_days: int, environment: str | None
+) -> dict[str, int]:
+    """Same shared predicate as _select_environment_counts, narrowed to
+    exclude rows already marked deactivated -- so repeated deactivation
+    calls only ever count/affect rows that are not yet deactivated."""
+    clause, params = build_predicate(inactive_days, environment)
+    clause += " AND status != 'deactivated'"
+    rows = conn.execute(
+        f"SELECT environment, COUNT(*) AS n FROM users WHERE {clause} GROUP BY environment",
+        params,
+    ).fetchall()
+    return zero_filled_counts(rows)
+
+
+def preview_deactivate_users(
+    inactive_days: int,
+    environment: str | None,
+    db_path: Path = WORKING_DB_PATH,
+) -> ImpactEnvelope:
+    """Compute the exact affected-row impact for a deactivate_users call.
+
+    Read-only, reversible: deactivation preserves every row, so this is
+    hard_delete=False. environment_counts already exclude rows that are
+    already deactivated.
+    """
+    conn = get_connection(db_path)
+    try:
+        environment_counts = _select_deactivation_environment_counts(
+            conn, inactive_days, environment
+        )
+    finally:
+        conn.close()
+
+    estimated_count = sum(environment_counts.values())
+    selector_hash = compute_selector_hash(
+        {"inactive_days": inactive_days, "environment": environment}
+    )
+
+    return ImpactEnvelope(
+        tool_name="deactivate_users",
+        estimated_count=estimated_count,
+        environment_counts=environment_counts,
+        hard_delete=False,
+        reversibility="reversible",
+        selector_hash=selector_hash,
+        generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    )
+
+
+def deactivate_users(
+    inactive_days: int,
+    environment: str | None,
+    db_path: Path = WORKING_DB_PATH,
+) -> MutationResult:
+    """Dumb reversible-status mutation.
+
+    Policy-unaware by design, same as delete_users: accepts no
+    ActionContext, rollback proof, policy configuration, or verdict. Sets
+    status='deactivated' on matching rows without deleting them, using the
+    same shared predicate (narrowed to exclude already-deactivated rows)
+    as preview_deactivate_users -- so this is idempotent: a repeated
+    identical call affects 0 rows because none remain eligible.
+    """
+    if Path(db_path).resolve() == PRISTINE_DB_PATH.resolve():
+        raise ValueError("Refusing to mutate the pristine database.")
+
+    conn = get_connection(db_path, isolation_level=None)
+    try:
+        clause, params = build_predicate(inactive_days, environment)
+        clause += " AND status != 'deactivated'"
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            environment_counts = _select_deactivation_environment_counts(
+                conn, inactive_days, environment
+            )
+            cursor = conn.execute(
+                f"UPDATE users SET status = 'deactivated' WHERE {clause}", params
+            )
+            expected = sum(environment_counts.values())
+            if cursor.rowcount != expected:
+                raise RuntimeError(
+                    f"Selection/deactivate mismatch: counted {expected}, updated {cursor.rowcount}"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    return MutationResult(
+        affected_count=sum(environment_counts.values()),
+        production_affected=environment_counts["production"],
+        test_affected=environment_counts["test"],
+    )
+
+
 def count_rows(db_path: Path = WORKING_DB_PATH, environment: str | None = None) -> int:
     """Count non-deleted rows, optionally filtered by environment. Test/demo helper."""
     conn = get_connection(db_path)

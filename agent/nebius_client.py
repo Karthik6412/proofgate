@@ -37,7 +37,8 @@ _ENVIRONMENT_PATTERNS = {
     "production": re.compile(r"\bproduction\b"),
 }
 _INACTIVITY_PATTERN = re.compile(r"(\d+)\s*day")
-_ACTION_PATTERN = re.compile(r"delete|clean\s*up|remove|purge")
+_DELETE_ACTION_PATTERN = re.compile(r"delete|clean\s*up|remove|purge")
+_DEACTIVATE_ACTION_PATTERN = re.compile(r"deactivat(e|ion)")
 
 
 def _scope_class_for_count(count: int) -> str:
@@ -65,7 +66,12 @@ def extract_intent(instruction: str) -> IntentConstraints:
     inactivity_match = _INACTIVITY_PATTERN.search(text)
     inactivity_days = int(inactivity_match.group(1)) if inactivity_match else None
 
-    action_type = "delete_users" if _ACTION_PATTERN.search(text) else "unknown"
+    if _DEACTIVATE_ACTION_PATTERN.search(text):
+        action_type = "deactivate_users"
+    elif _DELETE_ACTION_PATTERN.search(text):
+        action_type = "delete_users"
+    else:
+        action_type = "unknown"
     target_resource = "users" if ("user" in text or "account" in text) else "unknown"
 
     resolved_all = (
@@ -141,6 +147,10 @@ _ACTION_TYPE_SYNONYMS = {
     "delete": "delete_users",
     "delete_user": "delete_users",
     "delete_users": "delete_users",
+    "deactivate": "deactivate_users",
+    "deactivate_user": "deactivate_users",
+    "deactivate_users": "deactivate_users",
+    "deactivation": "deactivate_users",
 }
 
 _TARGET_RESOURCE_SYNONYMS = {
@@ -236,7 +246,7 @@ class _StrictRiskSchema(BaseModel):
 
 _INTENT_SYSTEM_PROMPT = (
     "You extract structured intent from a user instruction about deleting "
-    "user accounts. Respond with ONLY a single JSON object, no prose, no "
+    "or deactivating user accounts. Respond with ONLY a single JSON object, no prose, no "
     "markdown fences, matching exactly this shape: "
     '{"action_type": string, "target_resource": string, '
     '"environment": "test"|"production"|null, "inactivity_days": integer|null, '

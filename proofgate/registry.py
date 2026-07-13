@@ -47,6 +47,19 @@ def _delete_users_mutation(**kwargs) -> MutationResult:
     return operations_actions.delete_users(**kwargs)
 
 
+def _deactivate_users_preview(**kwargs) -> ImpactEnvelope:
+    """Call-time module-attribute lookup, same pattern as
+    _delete_users_preview, so operations.actions.preview_deactivate_users
+    stays patchable in tests."""
+    return operations_actions.preview_deactivate_users(**kwargs)
+
+
+def _deactivate_users_mutation(**kwargs) -> MutationResult:
+    """Call-time module-attribute lookup, same pattern as
+    _delete_users_mutation, for operations.actions.deactivate_users."""
+    return operations_actions.deactivate_users(**kwargs)
+
+
 _REGISTRY: dict[str, GuardedToolSpec] = {
     "delete_users": GuardedToolSpec(
         tool_name="delete_users",
@@ -56,6 +69,15 @@ _REGISTRY: dict[str, GuardedToolSpec] = {
         resource="users",
         hard_delete=True,
         reversibility="irreversible_without_snapshot",
+    ),
+    "deactivate_users": GuardedToolSpec(
+        tool_name="deactivate_users",
+        preview_fn=_deactivate_users_preview,
+        mutation_fn=_deactivate_users_mutation,
+        selector_argument_names=("inactive_days", "environment"),
+        resource="users",
+        hard_delete=False,
+        reversibility="reversible",
     ),
 }
 

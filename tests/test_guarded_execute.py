@@ -300,7 +300,7 @@ def test_unknown_tool_returns_block_and_not_executed():
     reset_workflow_state(workflow_id)
 
     result = guarded_execute(
-        tool_name="deactivate_users",
+        tool_name="reactivate_users",
         action_context=_action_context(workflow_id),
         arguments={"inactive_days": 90},
         rollback_proof=None,
@@ -315,7 +315,7 @@ def test_unknown_tool_triggers_rule_unknown_impact_only():
     reset_workflow_state(workflow_id)
 
     result = guarded_execute(
-        tool_name="deactivate_users",
+        tool_name="reactivate_users",
         action_context=_action_context(workflow_id),
         arguments={},
         rollback_proof=None,
@@ -333,7 +333,7 @@ def test_unknown_tool_never_calls_operations_preview_or_mutation():
         "operations.actions.delete_users"
     ) as mutation_spy:
         result = guarded_execute(
-            tool_name="deactivate_users",
+            tool_name="reactivate_users",
             action_context=_action_context(workflow_id),
             arguments={"inactive_days": 90},
             rollback_proof=None,
@@ -349,7 +349,7 @@ def test_unknown_tool_never_creates_a_snapshot():
 
     with mock.patch("operations.snapshots.create_snapshot") as snapshot_spy:
         guarded_execute(
-            tool_name="deactivate_users",
+            tool_name="reactivate_users",
             action_context=_action_context(workflow_id),
             arguments={},
             rollback_proof=None,
@@ -363,7 +363,7 @@ def test_unknown_tool_does_not_consume_workflow_budget():
     budget_before = get_workflow_budget(workflow_id).rows_mutated
 
     guarded_execute(
-        tool_name="deactivate_users",
+        tool_name="reactivate_users",
         action_context=_action_context(workflow_id),
         arguments={"inactive_days": 90},
         rollback_proof=None,
@@ -390,7 +390,7 @@ def test_unknown_tool_audit_event_has_no_fake_impact_or_mutation_data():
     reset_workflow_state(workflow_id)
 
     result = guarded_execute(
-        tool_name="deactivate_users",
+        tool_name="reactivate_users",
         action_context=_action_context(workflow_id),
         arguments={"inactive_days": 90},
         rollback_proof=None,
@@ -404,7 +404,7 @@ def test_unknown_tool_audit_event_has_no_fake_impact_or_mutation_data():
     assert audit_event["postcondition_result"] is None
     assert audit_event["proof_status"] == "MISSING"
     assert audit_event["proof_checks"] is None
-    assert audit_event["tool_name"] == "deactivate_users"
+    assert audit_event["tool_name"] == "reactivate_users"
     assert audit_event["workflow_budget_before"] == audit_event["workflow_budget_after"]
 
 
@@ -417,7 +417,7 @@ def test_unknown_tool_with_supplied_rollback_proof_reports_invalid_not_missing()
     )
 
     result = guarded_execute(
-        tool_name="deactivate_users",
+        tool_name="reactivate_users",
         action_context=_action_context(workflow_id),
         arguments={},
         rollback_proof=proof,
@@ -466,7 +466,7 @@ def test_registry_mutation_fn_produces_same_result_as_real_mutation_function():
 
 
 def test_registry_returns_none_for_unregistered_tool():
-    assert get_tool_spec("deactivate_users") is None
+    assert get_tool_spec("reactivate_users") is None
     assert get_tool_spec("") is None
 
 
