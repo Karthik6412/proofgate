@@ -15,17 +15,25 @@ from pathlib import Path
 import pytest
 
 from agent.agent_proposal import AgentProposalOutcome, AgentToolProposal, DiscoveredTool, ProposedMutationArguments
+from agent.agent_repair import AgentRepairProposal
 from proofgate.policy import RULE_INTENT_BOUNDARY, RULE_RECOVERY_PROOF, RULE_UNKNOWN_IMPACT, RULE_WORKFLOW_BUDGET
 from scripts.agent_loop import (
     REPO_ROOT,
+    RepairEligibility,
+    _build_not_attempted_workflow,
     aggregate_metrics,
     build_transcript,
     build_trusted_request,
+    build_workflow_summary,
     check_live_prerequisites,
+    classify_repair_change,
+    classify_repair_effect,
     classify_run,
     classify_scope,
     discovered_tools_from_mcp,
     fresh_workflow_id,
+    repair_eligibility,
+    repair_is_successful,
     validate_output_path,
     verify_audit_match,
 )
@@ -228,7 +236,15 @@ def test_classify_run_corrected_deactivate_allowed():
 # ---------------------------------------------------------------------------
 
 
+def _not_attempted_workflow(initial_record, reason="repair disabled"):
+    return _build_not_attempted_workflow(
+        initial_record["run_number"], initial_record["workflow_id"], initial_record, False, reason
+    )
+
+
 def _build_records():
+    """Slice-21-shaped flat classify_run records (still used directly by
+    the classify_run tests above and to build workflow wrappers below)."""
     records = []
     records.append(classify_run(1, "wf-1", _failed_outcome("upstream_failure"), None, None, False))
     records.append(
@@ -274,62 +290,80 @@ def _build_records():
     return records
 
 
+def _build_workflows():
+    """The same five Slice-21 scenarios, wrapped as repair-disabled
+    (NOT_ATTEMPTED) workflow records -- the shape aggregate_metrics/
+    build_transcript now require."""
+    return [_not_attempted_workflow(record) for record in _build_records()]
+
+
 def test_aggregate_metrics_totals():
-    metrics = aggregate_metrics(_build_records())
-    assert metrics["total_requested_runs"] == 5
-    assert metrics["valid_proposal_count"] == 4
-    assert metrics["proposal_failure_count"] == 1
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["total_workflows"] == 5
+    assert metrics["valid_initial_proposal_count"] == 4
+    assert metrics["initial_proposal_failure_count"] == 1
 
 
 def test_aggregate_metrics_tool_distribution():
-    metrics = aggregate_metrics(_build_records())
+    metrics = aggregate_metrics(_build_workflows())
     assert metrics["delete_users_proposal_count"] == 2
     assert metrics["deactivate_users_proposal_count"] == 2
 
 
 def test_aggregate_metrics_scope_distribution():
-    metrics = aggregate_metrics(_build_records())
+    metrics = aggregate_metrics(_build_workflows())
     assert metrics["broad_missing_environment_proposal_count"] == 2
     assert metrics["correctly_scoped_proposal_count"] == 2
     assert metrics["malformed_proposal_count"] == 1
 
 
 def test_aggregate_metrics_block_allow_counts():
-    metrics = aggregate_metrics(_build_records())
-    assert metrics["block_count"] == 3
-    assert metrics["allow_count"] == 1
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["initial_block_count"] == 3
+    assert metrics["initial_allow_count"] == 1
 
 
 def test_aggregate_metrics_execution_counts():
-    metrics = aggregate_metrics(_build_records())
-    assert metrics["execution_count"] == 1
-    assert metrics["non_execution_count"] == 4
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["total_executions"] == 1
 
 
 def test_aggregate_metrics_missing_filter_and_recovery_proof_only():
-    metrics = aggregate_metrics(_build_records())
-    assert metrics["missing_filter_mistake_count"] == 2
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["initial_missing_filter_mistake_count"] == 2
     assert metrics["recovery_proof_only_block_count"] == 1
     assert metrics["combined_scope_and_proof_block_count"] == 1
 
 
 def test_aggregate_metrics_rule_frequency():
-    metrics = aggregate_metrics(_build_records())
-    assert metrics["rule_frequency"][RULE_INTENT_BOUNDARY] == 2
-    assert metrics["rule_frequency"][RULE_RECOVERY_PROOF] == 2
-    assert metrics["rule_frequency"][RULE_WORKFLOW_BUDGET] == 2
-    assert metrics["rule_frequency"][RULE_UNKNOWN_IMPACT] == 0
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["initial_rule_frequency"][RULE_INTENT_BOUNDARY] == 2
+    assert metrics["initial_rule_frequency"][RULE_RECOVERY_PROOF] == 2
+    assert metrics["initial_rule_frequency"][RULE_WORKFLOW_BUDGET] == 2
+    assert metrics["initial_rule_frequency"][RULE_UNKNOWN_IMPACT] == 0
 
 
 def test_aggregate_metrics_production_mutation_total():
-    metrics = aggregate_metrics(_build_records())
-    assert metrics["production_rows_mutated_total"] == 0
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["total_production_rows_mutated"] == 0
 
 
 def test_aggregate_metrics_never_hides_any_run():
-    records = _build_records()
-    metrics = aggregate_metrics(records)
-    assert metrics["total_requested_runs"] == len(records)
+    workflows = _build_workflows()
+    metrics = aggregate_metrics(workflows)
+    assert metrics["total_workflows"] == len(workflows)
+
+
+def test_aggregate_metrics_repair_fields_are_zero_when_repair_disabled():
+    metrics = aggregate_metrics(_build_workflows())
+    assert metrics["repair_enabled_count"] == 0
+    assert metrics["repair_eligible_count"] == 0
+    assert metrics["repair_attempt_count"] == 0
+    assert metrics["repair_submission_count"] == 0
+    assert metrics["repair_success_count"] == 0
+    assert metrics["total_mcp_submissions"] == 4  # the one PROPOSAL_FAILURE never submits
+    assert metrics["max_submissions_per_workflow"] == 1
+    assert metrics["total_enforcement_audit_events"] == metrics["total_mcp_submissions"]
 
 
 # ---------------------------------------------------------------------------
@@ -366,28 +400,30 @@ def test_verify_audit_match_detects_mismatch():
 
 def test_build_transcript_contains_required_fields():
     tools = [DiscoveredTool(name="delete_users", description="x", input_schema={"type": "object"})]
-    records = _build_records()
-    metrics = aggregate_metrics(records)
+    workflows = _build_workflows()
+    metrics = aggregate_metrics(workflows)
     transcript = build_transcript(
         instruction=INSTRUCTION,
         requested_runs=5,
         discovered_tools=tools,
-        run_records=records,
+        workflow_records=workflows,
         metrics=metrics,
         runtime_mode="live",
         model_name="nvidia/nemotron-3-super-120b-a12b",
+        allow_repair=False,
     )
     for key in (
         "timestamp",
         "original_instruction",
         "requested_run_count",
         "discovered_tools",
-        "runs",
+        "workflows",
         "aggregate_metrics",
         "runtime_mode",
         "model",
         "mcp_transport",
         "rollback_proof_always_absent",
+        "repair_enabled",
         "production_mutation_total",
     ):
         assert key in transcript
@@ -399,25 +435,41 @@ def test_build_transcript_rollback_proof_always_absent_is_true():
         instruction=INSTRUCTION,
         requested_runs=1,
         discovered_tools=tools,
-        run_records=[],
+        workflow_records=[],
         metrics=aggregate_metrics([]),
         runtime_mode="live",
         model_name="m",
+        allow_repair=False,
     )
     assert transcript["rollback_proof_always_absent"] is True
 
 
+def test_build_transcript_repair_enabled_reflects_flag():
+    transcript = build_transcript(
+        instruction=INSTRUCTION,
+        requested_runs=1,
+        discovered_tools=[],
+        workflow_records=[],
+        metrics=aggregate_metrics([]),
+        runtime_mode="live",
+        model_name="m",
+        allow_repair=True,
+    )
+    assert transcript["repair_enabled"] is True
+
+
 def test_transcript_contains_no_fake_secrets(tmp_path):
     tools = [DiscoveredTool(name="delete_users", description="x", input_schema={"type": "object"})]
-    records = _build_records()
+    workflows = _build_workflows()
     transcript = build_transcript(
         instruction=INSTRUCTION,
         requested_runs=5,
         discovered_tools=tools,
-        run_records=records,
-        metrics=aggregate_metrics(records),
+        workflow_records=workflows,
+        metrics=aggregate_metrics(workflows),
         runtime_mode="live",
         model_name="nvidia/nemotron-3-super-120b-a12b",
+        allow_repair=False,
     )
     dumped = json.dumps(transcript)
     for marker in ("Authorization:", "Bearer ", "sk-", "NEBIUS_API_KEY", "access_token", "refresh_token"):
@@ -425,16 +477,17 @@ def test_transcript_contains_no_fake_secrets(tmp_path):
 
 
 def test_transcript_reports_production_mutation_total():
-    records = _build_records()
-    metrics = aggregate_metrics(records)
+    workflows = _build_workflows()
+    metrics = aggregate_metrics(workflows)
     transcript = build_transcript(
         instruction=INSTRUCTION,
         requested_runs=5,
         discovered_tools=[],
-        run_records=records,
+        workflow_records=workflows,
         metrics=metrics,
         runtime_mode="live",
         model_name="m",
+        allow_repair=False,
     )
     assert transcript["production_mutation_total"] == 0
 
@@ -627,6 +680,286 @@ def test_agent_loop_script_does_not_hardcode_a_duplicate_tool_list_as_source_of_
     # through discovered_tools_from_mcp(tools_result.tools).
     assert "discovered_tools_from_mcp(tools_result.tools)" in source
     assert '["delete_users", "deactivate_users"]' not in source
+
+
+# ---------------------------------------------------------------------------
+# Slice 22: repair eligibility
+# ---------------------------------------------------------------------------
+
+
+def _base_eligibility_kwargs(**overrides):
+    kwargs = dict(
+        allow_repair=True,
+        initial_proposal_valid=True,
+        submitted=True,
+        transport_succeeded=True,
+        verdict="BLOCK",
+        suggested_repairs=[{"tool": "delete_users", "arguments": {"environment": "test"}}],
+        executed=False,
+        repair_already_attempted=False,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_repair_eligibility_eligible_when_all_conditions_hold():
+    result = repair_eligibility(**_base_eligibility_kwargs())
+    assert result.eligible is True
+    assert result.reason is None
+
+
+def test_repair_eligibility_ineligible_when_flag_disabled():
+    result = repair_eligibility(**_base_eligibility_kwargs(allow_repair=False))
+    assert result.eligible is False
+    assert "allow-repair" in result.reason
+
+
+def test_repair_eligibility_ineligible_when_already_attempted():
+    result = repair_eligibility(**_base_eligibility_kwargs(repair_already_attempted=True))
+    assert result.eligible is False
+
+
+def test_repair_eligibility_ineligible_when_initial_proposal_invalid():
+    result = repair_eligibility(**_base_eligibility_kwargs(initial_proposal_valid=False))
+    assert result.eligible is False
+
+
+def test_repair_eligibility_ineligible_when_not_submitted():
+    result = repair_eligibility(**_base_eligibility_kwargs(submitted=False))
+    assert result.eligible is False
+
+
+def test_repair_eligibility_ineligible_when_transport_failed():
+    result = repair_eligibility(**_base_eligibility_kwargs(transport_succeeded=False))
+    assert result.eligible is False
+
+
+def test_repair_eligibility_ineligible_when_executed_true():
+    result = repair_eligibility(**_base_eligibility_kwargs(executed=True))
+    assert result.eligible is False
+    assert "executed" in result.reason
+
+
+def test_repair_eligibility_ineligible_when_verdict_not_block():
+    result = repair_eligibility(**_base_eligibility_kwargs(verdict="ALLOW"))
+    assert result.eligible is False
+
+
+def test_repair_eligibility_ineligible_when_no_suggested_repairs():
+    result = repair_eligibility(**_base_eligibility_kwargs(suggested_repairs=[]))
+    assert result.eligible is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 22: repair change / effect / success classification
+# ---------------------------------------------------------------------------
+
+
+def _proposal(tool_name="delete_users", inactive_days=90, environment=None, cls=AgentToolProposal):
+    return cls(
+        tool_name=tool_name,
+        arguments=ProposedMutationArguments(inactive_days=inactive_days, environment=environment),
+    )
+
+
+def test_classify_repair_change_unchanged():
+    initial = _proposal(environment="test")
+    repair = _proposal(environment="test", cls=AgentRepairProposal)
+    assert classify_repair_change(initial, repair) == "unchanged"
+
+
+def test_classify_repair_change_tool_changed():
+    initial = _proposal(tool_name="delete_users", environment="test")
+    repair = _proposal(tool_name="deactivate_users", environment="test", cls=AgentRepairProposal)
+    assert classify_repair_change(initial, repair) == "tool_changed"
+
+
+def test_classify_repair_change_scope_changed():
+    initial = _proposal(environment=None)
+    repair = _proposal(environment="test", cls=AgentRepairProposal)
+    assert classify_repair_change(initial, repair) == "scope_changed"
+
+
+def test_classify_repair_change_threshold_changed():
+    initial = _proposal(inactive_days=90, environment="test")
+    repair = _proposal(inactive_days=120, environment="test", cls=AgentRepairProposal)
+    assert classify_repair_change(initial, repair) == "threshold_changed"
+
+
+def test_classify_repair_change_multiple_fields_changed():
+    initial = _proposal(tool_name="delete_users", inactive_days=90, environment=None)
+    repair = _proposal(tool_name="deactivate_users", inactive_days=90, environment="test", cls=AgentRepairProposal)
+    assert classify_repair_change(initial, repair) == "multiple_fields_changed"
+
+
+def test_classify_repair_effect_not_attempted():
+    assert classify_repair_effect([RULE_RECOVERY_PROOF], "NOT_ATTEMPTED", None) == "not_attempted"
+
+
+def test_classify_repair_effect_proposal_failed():
+    assert classify_repair_effect([RULE_RECOVERY_PROOF], "PROPOSAL_FAILURE", None) == "proposal_failed"
+
+
+def test_classify_repair_effect_resolved_all_rules():
+    assert classify_repair_effect([RULE_RECOVERY_PROOF], "VALID_REPAIR", []) == "resolved_all_rules"
+
+
+def test_classify_repair_effect_resolved_some_rules():
+    assert (
+        classify_repair_effect(
+            [RULE_INTENT_BOUNDARY, RULE_RECOVERY_PROOF], "VALID_REPAIR", [RULE_RECOVERY_PROOF]
+        )
+        == "resolved_some_rules"
+    )
+
+
+def test_classify_repair_effect_resolved_no_rules():
+    assert (
+        classify_repair_effect([RULE_RECOVERY_PROOF], "VALID_REPAIR", [RULE_RECOVERY_PROOF]) == "resolved_no_rules"
+    )
+
+
+def test_classify_repair_effect_introduced_new_rules():
+    assert (
+        classify_repair_effect([RULE_RECOVERY_PROOF], "VALID_REPAIR", [RULE_INTENT_BOUNDARY, RULE_RECOVERY_PROOF])
+        == "introduced_new_rules"
+    )
+
+
+def test_repair_is_successful_true_case():
+    assert repair_is_successful("VALID_REPAIR", "ALLOW", 0, "VERIFIED") is True
+
+
+def test_repair_is_successful_false_when_blocked():
+    assert repair_is_successful("VALID_REPAIR", "BLOCK", 0, None) is False
+
+
+def test_repair_is_successful_false_when_production_affected():
+    assert repair_is_successful("VALID_REPAIR", "ALLOW", 5, "VERIFIED") is False
+
+
+def test_repair_is_successful_false_when_postcondition_not_verified():
+    assert repair_is_successful("VALID_REPAIR", "ALLOW", 0, "MISMATCH") is False
+
+
+def test_repair_is_successful_false_when_proposal_failed():
+    assert repair_is_successful("PROPOSAL_FAILURE", None, 0, None) is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 22: workflow summary
+# ---------------------------------------------------------------------------
+
+
+def test_build_workflow_summary_not_attempted():
+    initial = classify_run(
+        1,
+        "wf-1",
+        _valid_outcome(tool_name="delete_users", environment=None),
+        _mcp_response("BLOCK", False, [RULE_INTENT_BOUNDARY, RULE_RECOVERY_PROOF, RULE_WORKFLOW_BUDGET]),
+        False,
+        False,
+    )
+    workflow = _not_attempted_workflow(initial)
+    summary = build_workflow_summary(workflow)
+    assert summary["repair_attempted"] is False
+    assert summary["repair_status"] == "NOT_ATTEMPTED"
+    assert summary["mcp_submission_count"] == 1
+    assert summary["audit_event_count"] == 1
+    assert summary["production_mutation_count"] == 0
+
+
+def test_build_workflow_summary_with_repair():
+    initial = classify_run(
+        1,
+        "wf-1",
+        _valid_outcome(tool_name="delete_users", environment="test"),
+        _mcp_response("BLOCK", False, [RULE_RECOVERY_PROOF]),
+        False,
+        False,
+    )
+    repair = classify_run(
+        1,
+        "wf-1",
+        _valid_outcome(tool_name="deactivate_users", environment="test"),
+        _mcp_response("ALLOW", True, [], production_affected=0, test_affected=92, postcondition_status="VERIFIED"),
+        False,
+        False,
+        attempt="repair",
+    )
+    workflow = {
+        "run_number": 1,
+        "workflow_id": "wf-1",
+        "initial": initial,
+        "repair_enabled": True,
+        "repair_eligibility": {"eligible": True, "reason": None},
+        "repair_status": "VALID_REPAIR",
+        "repair_error_category": None,
+        "sanitized_feedback": None,
+        "repair": repair,
+        "repair_change": "tool_changed",
+        "repair_effect": "resolved_all_rules",
+        "repair_success": True,
+        "trusted_repair_request": None,
+    }
+    summary = build_workflow_summary(workflow)
+    assert summary["repair_attempted"] is True
+    assert summary["repair_verdict"] == "ALLOW"
+    assert summary["mcp_submission_count"] == 2
+    assert summary["audit_event_count"] == 2
+    assert summary["execution_count"] == 1
+    assert summary["test_mutation_count"] == 92
+    assert summary["final_postcondition"] == "VERIFIED"
+
+
+# ---------------------------------------------------------------------------
+# Slice 22: CLI flag regression (default off = Slice 21 exactly)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_help_lists_allow_repair_flag_default_off():
+    result = subprocess.run(
+        [sys.executable, "scripts/agent_loop.py", "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert "--allow-repair" in result.stdout
+
+
+def test_cli_exits_nonzero_when_mode_is_not_live_with_allow_repair():
+    result = _run_cli(
+        ["--runs", "3", "--allow-repair"],
+        env={"PROOFGATE_RUNTIME_MODE": "fallback", "PATH": "/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 1
+    assert "live" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# Slice 22: boundedness -- structural (not merely disciplined) loop prevention
+# ---------------------------------------------------------------------------
+
+
+def test_agent_loop_script_has_no_while_loop_in_run_experiment():
+    import ast
+
+    source = (REPO_ROOT / "scripts" / "agent_loop.py").read_text()
+    tree = ast.parse(source)
+    target = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_experiment")
+    assert not any(isinstance(n, ast.While) for n in ast.walk(target))
+
+
+def test_agent_loop_script_calls_propose_repair_at_most_once_textually():
+    source = (REPO_ROOT / "scripts" / "agent_loop.py").read_text()
+    assert source.count("propose_repair(") == 1
+
+
+def test_agent_loop_script_submits_at_most_twice_per_workflow():
+    source = (REPO_ROOT / "scripts" / "agent_loop.py").read_text()
+    # One function definition plus exactly two call sites (initial, repair).
+    assert source.count("_submit_via_mcp(") == 3
 
 
 # ---------------------------------------------------------------------------

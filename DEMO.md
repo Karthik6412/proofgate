@@ -659,8 +659,10 @@ experiment.
 
 ### Known limitations
 
-- No repair/retry loop exists in this slice -- a `PROPOSAL_FAILURE` run is
-  recorded and skipped, never retried automatically.
+- No retry loop exists in this slice -- a `PROPOSAL_FAILURE` run is
+  recorded and skipped, never retried automatically. (Slice 22, below,
+  adds one opt-in bounded repair *attempt* after an eligible `BLOCK` --
+  still not a loop, and still never retried.)
 - Real model nondeterminism and provider latency/rate-limit behavior are
   not characterized beyond a small local sample.
 - Explicit live CRAFT (Slice 20.1) is unrelated to and untouched by this
@@ -675,3 +677,142 @@ the audit log before it starts. After the full experiment, the script
 resets the database and audit log again, leaving the repository in clean
 deterministic runtime state regardless of how many runs were requested or
 how they were classified.
+
+## One bounded repair attempt (Slice 22)
+
+`--allow-repair` is an opt-in flag on the same script. **Default off means
+Slice 21 behavior exactly** -- no repair prompt is built, no second
+provider request is made, and at most one MCP submission occurs per
+workflow, identically to Slice 21.
+
+```bash
+source .venv/bin/activate
+PROOFGATE_RUNTIME_MODE=live python scripts/agent_loop.py --runs 5 --allow-repair
+```
+
+### What a repair attempt is
+
+After the real, unchanged initial proposal is submitted through the real
+MCP gateway exactly as in Slice 21, if (and only if) every one of these
+holds:
+
+- the initial proposal was valid and was actually submitted,
+- MCP transport succeeded,
+- the verdict was `BLOCK`,
+- `executed` was `false`,
+- ProofGate's own response included a non-empty `suggested_repairs` list,
+- repair has not already been attempted for this workflow, and
+- `--allow-repair` was passed,
+
+...the script makes **exactly one** additional provider request
+(`agent/agent_repair.py::propose_repair`), asking the same live model to
+revise its tool choice and/or business arguments in light of ProofGate's
+own real enforcement feedback, then submits **exactly one** additional
+request through the same real MCP gateway. A second `BLOCK` ends the
+workflow -- there is no second repair attempt, no retry of the repair
+model call, and no retry of the repair MCP submission.
+
+If the initial `BLOCK` ever reports `executed=true`, this is treated as a
+hard safety failure: the run stops immediately, state is reset, and it is
+reported prominently rather than treated as an ordinary ineligible case.
+
+### What the repair model sees (and does not see)
+
+The repair model receives: the unchanged original instruction, its own
+original validated proposal, the actual verdict, the actual triggered
+rule identifiers, and ProofGate's exact `suggested_repairs` list --
+**passed through completely unchanged**, never rewritten, summarized, or
+reinterpreted -- plus the same live-discovered tool names/descriptions/
+schemas used for the initial proposal.
+
+It does **not** see: the full MCP response, audit metadata, the workflow
+ID, raw budget internals beyond what `suggested_repairs` already
+contains, database paths, selector hashes, snapshot paths, proof
+payloads, API keys, `.env` values, or any instruction telling it which
+tool or `environment` value to pick. It is asked only for "one revised
+tool choice and business argument set that responds to the supplied
+enforcement feedback," plus an optional short explanation.
+
+`agent/agent_repair.py`'s `AgentRepairProposal` and `SanitizedRepairFeedback`
+both use `extra="forbid"`, so any attempt by the model to also emit
+`rollback_proof`, `workflow_id`, `instruction`, proof data, a verdict, or
+any other control-plane field -- top-level or nested -- is rejected by
+construction, exactly like Slice 21's `AgentToolProposal`.
+
+### No proof creation or attachment
+
+> Slice 22 does not create, attach, or repair rollback proof. Both
+> initial and repaired submissions use `rollback_proof=null`. The agent
+> may respond to recovery guidance by selecting a reversible tool, but it
+> cannot satisfy recovery-proof requirements by inventing evidence.
+
+> The repair model may revise the selected tool and business arguments
+> once. The revised request is reevaluated through the same real MCP
+> gateway and the same deterministic ProofGate policy path.
+
+A repaired `deactivate_users` proposal may `ALLOW` because deactivation is
+reversible -- not because any proof was supplied. A repaired `delete_users`
+proposal, even correctly scoped to `environment="test"`, remains `BLOCK`ed
+by `RULE_RECOVERY_PROOF` alone, because no proof exists on either attempt.
+
+### Same workflow ID, same audit log, same budget
+
+The initial and repair attempts share one workflow ID. This is safe and
+intentional, verified directly against the actual implementation before
+Slice 22 was built (not assumed): `proofgate/audit.py` enforces no
+uniqueness constraint on `workflow_id` (each event gets its own globally
+unique `event_id`, and the MCP server's own audit lookup matches on
+`event_id`, never `workflow_id`), and `proofgate/budgets.py::record_execution`
+is the only function that increments workflow budget, called only on
+`ALLOW` -- so a `BLOCK` (initial or repair) always consumes zero budget,
+and an `ALLOW`ed repair consumes budget exactly once. A real live run
+confirms this empirically: both the initial and repair audit events for
+each workflow share the same `workflow_id`, appear in submission order,
+and each one's own response reflects only that submission's own data.
+
+### Repair classification
+
+Each workflow reports:
+
+- `repair_status`: `NOT_ATTEMPTED | PROPOSAL_FAILURE | VALID_REPAIR |
+  MCP_VALIDATION_FAILURE | TRANSPORT_FAILURE`
+- `repair_change` (comparing the validated initial and repair proposals):
+  `unchanged | tool_changed | scope_changed | threshold_changed |
+  multiple_fields_changed`
+- `repair_effect` (comparing the initial and repair triggered-rule sets):
+  `resolved_all_rules | resolved_some_rules | resolved_no_rules |
+  introduced_new_rules | proposal_failed | not_attempted`
+- `repair_success`: only `true` when the repair was actually submitted,
+  `ALLOW`ed, mutated zero production rows, and reached a `VERIFIED`
+  postcondition -- a `BLOCK`ed repair (e.g. a repaired `delete_users`
+  still lacking proof) is reported honestly as an unsuccessful repair
+  safely rejected by ProofGate, never as a system failure.
+
+### Boundedness (structural, not just disciplined)
+
+- At most one repair-model provider request per workflow
+  (`propose_repair` has exactly one call site in `scripts/agent_loop.py`).
+- At most two MCP submissions per workflow (`_submit_via_mcp` has exactly
+  two call sites: initial, repair).
+- No `while` loop and no recursive repair call in `_run_experiment`.
+- A second `BLOCK` (on the repaired attempt) ends the workflow; there is
+  no second eligibility check and no second repair attempt.
+
+### Offline test behavior
+
+`tests/test_agent_repair.py` covers repair-proposal validation (valid
+unchanged/tool-switch/scope-change/threshold-change/multi-field repairs;
+rejection of every control-plane field, top-level and nested) and
+`propose_repair`'s success/failure paths using a fake provider client --
+no real network. `tests/test_agent_loop_script.py` covers repair
+eligibility (every combination), change/effect/success classification,
+workflow-summary assembly, aggregate metrics with and without repair, the
+structural boundedness checks above, and CLI regression confirming
+`--allow-repair`'s default-off behavior is textually and behaviorally
+identical to Slice 21.
+
+### Streamlit and reliable-demo: unchanged
+
+`app.py`, `app_logic.py`, and the `RELIABLE_DEMO` runtime mode are
+completely untouched by this slice -- confirmed by `git diff --stat --
+app.py app_logic.py` reporting no changes.
