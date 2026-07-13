@@ -89,3 +89,13 @@ def get_tool_spec(tool_name: str) -> GuardedToolSpec | None:
     None -- it never guesses at unregistered tool behavior.
     """
     return _REGISTRY.get(tool_name)
+
+
+def registered_tool_names() -> tuple[str, ...]:
+    """Read-only enumeration of every registered tool name.
+
+    Used by proofgate/mcp_server.py to assert its explicit, hardcoded
+    public MCP tool list actually matches the registry at startup -- never
+    used to dynamically publish tools through any transport.
+    """
+    return tuple(_REGISTRY.keys())

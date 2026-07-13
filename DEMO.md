@@ -290,3 +290,135 @@ To confirm the test suite is healthy before presenting:
 ```bash
 .venv/bin/pytest tests/ -q
 ```
+
+## MCP guarded gateway (Slice 19)
+
+ProofGate can also run as an MCP server, so an external MCP-compatible
+agent client -- not just this Streamlit app -- can call the guarded
+`delete_users` and `deactivate_users` actions.
+
+> The current MCP gateway exposes the registered `delete_users` and
+> `deactivate_users` actions through ProofGate's shared guarded execution
+> boundary.
+
+It does **not** automatically govern arbitrary MCP tools, and Operations
+functions (preview, mutation, snapshot creation, database/audit reset)
+are never exposed as public MCP tools -- only the two guarded actions
+above are.
+
+### Package, transport, and startup
+
+- Package: `mcp` (already an approved dependency), version **1.28.1**.
+- Transport: **stdio** (the SDK's low-level `mcp.server.lowlevel.Server`,
+  not `FastMCP`'s decorator sugar -- see `proofgate/mcp_server.py`'s module
+  docstring for why).
+- Start it with:
+
+  ```bash
+  source .venv/bin/activate
+  NEBIUS_LIVE_ENABLED=false CRAFT_LIVE_ENABLED=false python -m proofgate.mcp_server
+  ```
+
+- Importing `proofgate.mcp_server` never starts a server -- it only
+  constructs the `Server` object and registers handlers (plus one cheap
+  startup assertion that the registry still contains both expected
+  tools). The stdio loop only begins under `if __name__ == "__main__":`.
+
+### Minimal request shape
+
+Both tools accept the same flat JSON shape:
+
+```json
+{
+  "instruction": "Clean up inactive test accounts that have not logged in for 90 days.",
+  "workflow_id": "mcp-run-001",
+  "inactive_days": 90,
+  "environment": null,
+  "rollback_proof": null
+}
+```
+
+`rollback_proof`, when supplied for `delete_users`, uses the exact same
+`RollbackProof` shape as everywhere else in ProofGate (`snapshot_id`,
+`resource`, `selector_hash`, `max_affected_rows`) -- the server
+cross-validates it against real server-side snapshot metadata exactly as
+the existing `validate_rollback_proof` already does; it never trusts the
+client's claim alone. `deactivate_users` never requires a proof.
+
+### Expected behavior
+
+- Broad `delete_users` (`environment=null`): structured `BLOCK`, `10,073`
+  total / `9,981` production / `92` test, triggered rules exactly
+  `RULE_INTENT_BOUNDARY`, `RULE_RECOVERY_PROOF`, `RULE_WORKFLOW_BUDGET`.
+- Broad `deactivate_users` (`environment=null`): structured `BLOCK`, same
+  counts, triggered rules exactly `RULE_INTENT_BOUNDARY`,
+  `RULE_WORKFLOW_BUDGET` (no `RULE_RECOVERY_PROOF`).
+- **A policy `BLOCK` is returned as normal structured MCP tool output**,
+  not a transport-level error. Only malformed input, an unregistered tool
+  name, or an internal failure produce an MCP tool error.
+- A valid call that reaches ProofGate's guarded pipeline writes **exactly
+  one** normal ProofGate audit event, through the same shared
+  `artifacts/audit.jsonl` path and schema used by Streamlit and direct
+  Python calls.
+- An invalid, schema-level request (unknown field, wrong type, missing
+  required field) never reaches the guarded pipeline and writes **zero**
+  audit events.
+
+### Input normalization (narrow and tested)
+
+Allowed: trimming surrounding whitespace on `instruction`/`workflow_id`;
+`"TEST"`/`"PRODUCTION"` (any case) normalized to `"test"`/`"production"`;
+a strictly numeric string such as `"90"` accepted for `inactive_days`.
+
+Rejected before the guarded pipeline ever runs: unknown/misspelled fields
+(e.g. `enviroment`), non-numeric strings (`"ninety"`), negative or zero
+`inactive_days`, floating-point thresholds, unsupported environment
+aliases (e.g. `"testing"`), and any omitted required field.
+
+### Concurrency, queueing, and shutdown
+
+- The tool handler is `async def` (required by the installed SDK), but
+  calls the existing synchronous `guarded_execute(...)` with no
+  surrounding `await`. Because the SDK dispatches on a single-threaded
+  event loop, a synchronous call cannot be preempted mid-execution --
+  every consequential call in one server process is therefore processed
+  **strictly serially**, with **no explicit lock, semaphore, or queue**.
+  This is proven deterministically (not by timing) in
+  `tests/test_mcp_server.py`'s concurrency test.
+- Because no explicit lock/queue exists, there is no queue-wait timeout
+  to configure or test -- this is stated explicitly rather than silently
+  omitted.
+- This serialization guarantee is scoped to one server process. Running
+  this gateway and the Streamlit app against the same
+  `operations/working.db` at the same time is not covered by this
+  guarantee and is out of scope for this slice.
+- `SIGTERM`/`SIGINT` set a shutdown flag (the raw signal handler does
+  nothing beyond that plus one log line); once set, new consequential
+  calls are rejected with a safe structured error before any guarded work
+  begins. An already-in-flight call is not interrupted -- it cannot be,
+  short of killing the process. This gateway does not claim protection
+  from `SIGKILL`, power loss, or abrupt termination.
+
+### Logging
+
+All server-side logs go to **stderr** (`proofgate.mcp_server`'s own
+logger, plus the SDK's own default). Stdout is reserved exclusively for
+MCP protocol frames; the server never calls `print()`. Verified directly:
+a raw subprocess run with no client attached produced exactly 0 bytes on
+stdout.
+
+### Local-development-only limitations
+
+This is a local, single-process, unauthenticated stdio server for
+development and demonstration. It has no network authentication, no
+deployment infrastructure, no multi-tenant isolation, and no crash/restart
+supervisor. Transaction boundaries in `operations/actions.py` (explicit
+`BEGIN IMMEDIATE` + commit/rollback + scoped connections, already in place
+before this slice) are unchanged and were only inspected, not rewritten,
+for this slice.
+
+Run the MCP-specific tests directly with:
+
+```bash
+.venv/bin/pytest tests/test_mcp_server.py -q
+```
