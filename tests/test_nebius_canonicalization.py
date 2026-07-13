@@ -404,7 +404,7 @@ def test_preview_failure_with_live_intent_reports_mixed(monkeypatch):
 
     # Make preview_delete_users fail by pointing it at a nonexistent db path.
     monkeypatch.setattr(
-        "proofgate.core.preview_delete_users",
+        "operations.actions.preview_delete_users",
         lambda inactive_days, environment: (_ for _ in ()).throw(RuntimeError("preview failed")),
     )
 
@@ -425,7 +425,7 @@ def test_preview_failure_with_live_intent_reports_mixed(monkeypatch):
 def test_preview_failure_with_fallback_intent_reports_deterministic_fallback(monkeypatch):
     # conftest.py default: NEBIUS_LIVE_ENABLED=false, so intent uses fallback.
     monkeypatch.setattr(
-        "proofgate.core.preview_delete_users",
+        "operations.actions.preview_delete_users",
         lambda inactive_days, environment: (_ for _ in ()).throw(RuntimeError("preview failed")),
     )
 
@@ -459,7 +459,7 @@ def test_never_reports_nebius_live_when_risk_never_ran(monkeypatch):
     fake_client = FakeNebiusClient(content=valid_intent_json)
     monkeypatch.setattr(nebius_client_module, "_build_client", lambda: fake_client)
     monkeypatch.setattr(
-        "proofgate.core.preview_delete_users",
+        "operations.actions.preview_delete_users",
         lambda inactive_days, environment: (_ for _ in ()).throw(RuntimeError("preview failed")),
     )
 

@@ -1,0 +1,20 @@
+{
+  "label": "CRAFT enterprise evidence",
+  "mode": "live",
+  "database": "thelook-ecommerce-0f0a359c",
+  "question": "Using the available e-commerce schema, count customers whose most recent order is at least 90 days before the latest order date represented in the dataset. Return a small read-only cohort summary.",
+  "generated_sql": "WITH latest AS (\n  SELECT TO_TIMESTAMP(MAX(\"created_at\") / 1000000) AS max_order_date\n  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.ORDERS\n),\ncustomer_last_order AS (\n  SELECT \n    \"user_id\",\n    TO_TIMESTAMP(MAX(\"created_at\") / 1000000) AS last_order_date\n  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.ORDERS\n  GROUP BY \"user_id\"\n)\nSELECT \n  l.max_order_date                                       AS dataset_latest_order_date,\n  DATEADD('day', -90, l.max_order_date)::DATE            AS cutoff_date,\n  COUNT(*)                                               AS inactive_customer_count,\n  (SELECT COUNT(DISTINCT \"user_id\") \n     FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.ORDERS)   AS total_customers,\n  ROUND(COUNT(*) * 100.0 / \n        (SELECT COUNT(DISTINCT \"user_id\") \n           FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.ORDERS), 1) AS pct_inactive\nFROM customer_last_order c\nCROSS JOIN latest l\nWHERE c.last_order_date <= DATEADD('day', -90, l.max_order_date)\nGROUP BY l.max_order_date",
+  "result_summary": "Returned 1 row(s) (showing up to 5).",
+  "result_preview": [],
+  "tool_trace": [
+    "list_tools",
+    "list_data_connections",
+    "list_databases",
+    "get_schema",
+    "generate_sql",
+    "execute_query",
+    "get_result_page"
+  ],
+  "retrieved_at": "2026-07-11T20:19:02.346599+00:00",
+  "authoritative_for_mutation_impact": false
+}

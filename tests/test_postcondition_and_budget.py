@@ -398,7 +398,7 @@ def test_operations_delete_users_called_exactly_once_and_only_after_allow():
     )
 
     with mock.patch(
-        "proofgate.core.delete_users", wraps=operations_actions.delete_users
+        "operations.actions.delete_users", wraps=operations_actions.delete_users
     ) as spy:
         blocked = guarded_delete_users(
             action_context=_action_context(workflow_id),

@@ -348,7 +348,7 @@ def test_corrected_call_with_valid_proof_is_allowed_and_deletes_exactly_92_test_
     workflow_id = "wf-allow"
 
     with mock.patch(
-        "proofgate.core.delete_users", wraps=operations_actions.delete_users
+        "operations.actions.delete_users", wraps=operations_actions.delete_users
     ) as spy:
         result = guarded_delete_users(
             action_context=_action_context(workflow_id),
@@ -374,7 +374,7 @@ def test_corrected_call_with_valid_proof_is_allowed_and_deletes_exactly_92_test_
 
 def test_delete_users_never_invoked_before_allow():
     with mock.patch(
-        "proofgate.core.delete_users", wraps=operations_actions.delete_users
+        "operations.actions.delete_users", wraps=operations_actions.delete_users
     ) as spy:
         result = guarded_delete_users(
             action_context=_action_context(),

@@ -1,24 +1,32 @@
 """ProofGate protected action boundary.
 
-guarded_delete_users is the sole caller path that may reach
-operations.delete_users, and only after a genuine deterministic ALLOW.
-Proof establishes recoverability, not authorization: a valid rollback
-proof can clear RULE_RECOVERY_PROOF, but it never overrides
-RULE_INTENT_BOUNDARY or RULE_WORKFLOW_BUDGET. Immediately after a genuine
-ALLOW, the mutation is verified against its pre-execution ImpactEnvelope
-and the real per-workflow budget is updated using the actual executed
-counts. Every invocation writes exactly one audit event built from the
-values this function already computed -- nothing is recomputed for
-audit purposes. CRAFT evidence (upstream, read-only, never authoritative
-for mutation impact) is only ever retrieved here by workflow_id from
-already-stored state; this function never calls CRAFT.
+guarded_execute is the sole generic caller path that may reach a
+registered tool's mutation function, and only after a genuine
+deterministic ALLOW. guarded_delete_users is a thin compatibility wrapper
+around guarded_execute("delete_users", ...) -- the pipeline itself is
+unchanged from prior slices, only how it's invoked. Proof establishes
+recoverability, not authorization: a valid rollback proof can clear
+RULE_RECOVERY_PROOF, but it never overrides RULE_INTENT_BOUNDARY or
+RULE_WORKFLOW_BUDGET. Immediately after a genuine ALLOW, the mutation is
+verified against its pre-execution ImpactEnvelope and the real
+per-workflow budget is updated using the actual executed counts. Every
+invocation writes exactly one audit event built from the values this
+function already computed -- nothing is recomputed for audit purposes.
+CRAFT evidence (upstream, read-only, never authoritative for mutation
+impact) is only ever retrieved here by workflow_id from already-stored
+state; this function never calls CRAFT.
+
+Unregistered tool_name values fail closed: RULE_UNKNOWN_IMPACT fires and
+nothing is previewed, executed, snapshotted, or budget-consumed. Intent
+extraction still runs for an unknown tool -- it operates only on the
+free-text original_instruction, is side-effect-free, and is needed to
+honestly populate AuditEvent.intent_constraints (a required field).
 """
 
 from agent.nebius_client import (
     extract_intent_live_or_fallback,
     extract_risk_features_live_or_fallback,
 )
-from operations.actions import delete_users, preview_delete_users
 from proofgate.audit import SCHEMA_VERSION, append_audit_event, current_timestamp, new_event_id
 from proofgate.budgets import (
     get_craft_evidence,
@@ -28,9 +36,10 @@ from proofgate.budgets import (
     record_execution,
     reset_workflow_state,
 )
-from proofgate.models import ActionContext, AuditEvent, EnforcementResult, RollbackProof
+from proofgate.models import ActionContext, AuditEvent, EnforcementResult, RollbackProof, TriggeredRule
 from proofgate.policy import (
     POLICY_VERSION,
+    RULE_UNKNOWN_IMPACT,
     build_missing_requirements,
     build_suggested_repairs,
     compute_risk_score,
@@ -38,13 +47,12 @@ from proofgate.policy import (
 )
 from proofgate.postcondition import verify_postcondition
 from proofgate.proofs import validate_rollback_proof
-
-RESOURCE_USERS = "users"
-TOOL_NAME = "delete_users"
+from proofgate.registry import get_tool_spec
 
 # Re-exported so callers/tests can reach per-workflow state through
 # proofgate.core, same as get_workflow_budget/reset_workflow_state.
 __all__ = [
+    "guarded_execute",
     "guarded_delete_users",
     "get_last_mutation_result",
     "get_last_postcondition_result",
@@ -53,27 +61,49 @@ __all__ = [
 ]
 
 
-def guarded_delete_users(
+def guarded_execute(
+    tool_name: str,
     action_context: ActionContext,
-    inactive_days: int,
-    environment: str | None,
+    arguments: dict,
     rollback_proof: RollbackProof | None,
 ) -> EnforcementResult:
+    """Generic enforcement entrypoint. Looks up tool_name in the registry
+    (proofgate.registry); unregistered tools fail closed via
+    _guarded_execute_unknown_tool. For a registered tool, this runs the
+    same pipeline guarded_delete_users always ran: intent extraction,
+    authoritative preview, risk extraction, deterministic policy, proof
+    validation, workflow budget, mutation (only after ALLOW), postcondition
+    verification, and exactly one audit event.
+    """
     event_id = new_event_id()
-    proposed_arguments = {"inactive_days": inactive_days, "environment": environment}
+
+    spec = get_tool_spec(tool_name)
+    if spec is None:
+        return _guarded_execute_unknown_tool(
+            event_id, tool_name, action_context, arguments, rollback_proof
+        )
+
+    # Only the mutation-selecting arguments this tool declares -- never
+    # rollback_proof, action_context, or any policy/risk/workflow/audit
+    # metadata. Selector hashing itself still happens only inside the
+    # registered preview/mutation functions, via the one shared
+    # proofgate.selector implementation.
+    selector_arguments = {
+        name: arguments[name] for name in spec.selector_argument_names if name in arguments
+    }
 
     intent_outcome = extract_intent_live_or_fallback(action_context.original_instruction)
     intent = intent_outcome.value
 
     try:
-        impact = preview_delete_users(inactive_days=inactive_days, environment=environment)
+        impact = spec.preview_fn(**arguments)
     except Exception:
         impact = None
 
     proof_validation = None
     if impact is not None:
         proof_validation = validate_rollback_proof(
-            rollback_proof, resource=RESOURCE_USERS, impact=impact
+            rollback_proof, resource=spec.resource, impact=impact
         )
         rollback_proof_valid = proof_validation.valid
     else:
@@ -81,7 +111,7 @@ def guarded_delete_users(
 
     risk_outcome = (
         extract_risk_features_live_or_fallback(
-            action_context.original_instruction, intent, proposed_arguments, impact
+            action_context.original_instruction, intent, selector_arguments, impact
         )
         if impact is not None
         else None
@@ -93,7 +123,7 @@ def guarded_delete_users(
 
     triggered_rules, risk_factors = evaluate_policy(
         intent=intent,
-        proposed_arguments=proposed_arguments,
+        proposed_arguments=selector_arguments,
         impact=impact,
         risk=risk,
         rollback_proof_valid=rollback_proof_valid,
@@ -117,13 +147,15 @@ def guarded_delete_users(
         impact=impact,
         workflow_budget=workflow_budget,
     )
-    suggested_repairs = build_suggested_repairs(intent=intent, inactive_days=inactive_days)
+    suggested_repairs = build_suggested_repairs(
+        intent=intent, inactive_days=arguments.get("inactive_days")
+    )
 
     mutation_result = None
     postcondition_result = None
     executed = False
     if verdict == "ALLOW":
-        mutation_result = delete_users(inactive_days=inactive_days, environment=environment)
+        mutation_result = spec.mutation_fn(**arguments)
         postcondition_result = verify_postcondition(impact, mutation_result)
         record_execution(action_context.workflow_id, mutation_result, postcondition_result)
         executed = True
@@ -173,8 +205,8 @@ def guarded_delete_users(
         original_instruction=action_context.original_instruction,
         requesting_user=action_context.requesting_user,
         agent_id=action_context.agent_id,
-        tool_name=TOOL_NAME,
-        tool_arguments=proposed_arguments,
+        tool_name=tool_name,
+        tool_arguments=arguments,
         intent_constraints=intent,
         impact_envelope=impact,
         risk_features=risk,
@@ -207,4 +239,107 @@ def guarded_delete_users(
         suggested_repairs=suggested_repairs,
         executed=executed,
         audit_event_id=event_id,
+    )
+
+
+def _guarded_execute_unknown_tool(
+    event_id: str,
+    tool_name: str,
+    action_context: ActionContext,
+    arguments: dict,
+    rollback_proof: RollbackProof | None,
+) -> EnforcementResult:
+    """Fail-closed path for an unregistered tool_name.
+
+    No Operations preview, no risk extraction, no mutation, no snapshot,
+    no workflow-budget consumption. suggested_repairs is deliberately
+    always [] here: the existing build_suggested_repairs helper hardcodes
+    "tool": "delete_users", which would misattribute a repair suggestion
+    to the wrong tool for a genuinely unknown tool_name.
+    """
+    intent_outcome = extract_intent_live_or_fallback(action_context.original_instruction)
+    intent = intent_outcome.value
+
+    workflow_budget = get_workflow_budget(action_context.workflow_id)
+    budget_snapshot = workflow_budget.model_copy()
+
+    triggered_rules = [
+        TriggeredRule(
+            rule_id=RULE_UNKNOWN_IMPACT,
+            explanation=f"Tool {tool_name!r} is not registered; impact cannot be measured.",
+        )
+    ]
+    risk_score = 10.0
+    missing_requirements = build_missing_requirements(
+        intent=intent, rollback_proof_valid=False, impact=None, workflow_budget=workflow_budget
+    )
+
+    extraction_mode = "mixed" if intent_outcome.mode == "nebius_live" else "deterministic_fallback"
+    craft_evidence = get_craft_evidence(action_context.workflow_id)
+
+    # Same "impact unknown" convention as the registered-tool path: no
+    # preview ever ran, so no proof validation had an ImpactEnvelope to
+    # check against, regardless of whether a proof was supplied.
+    proof_status = "MISSING" if rollback_proof is None else "INVALID"
+
+    audit_event = AuditEvent(
+        schema_version=SCHEMA_VERSION,
+        event_id=event_id,
+        workflow_id=action_context.workflow_id,
+        timestamp=current_timestamp(),
+        original_instruction=action_context.original_instruction,
+        requesting_user=action_context.requesting_user,
+        agent_id=action_context.agent_id,
+        tool_name=tool_name,
+        tool_arguments=arguments,
+        intent_constraints=intent,
+        impact_envelope=None,
+        risk_features=None,
+        risk_score=risk_score,
+        risk_factors=[],
+        triggered_rules=triggered_rules,
+        policy_version=POLICY_VERSION,
+        extraction_mode=extraction_mode,
+        nebius_model=intent_outcome.model,
+        craft_evidence=craft_evidence,
+        verdict="BLOCK",
+        missing_requirements=missing_requirements,
+        suggested_repairs=[],
+        proof_status=proof_status,
+        proof_checks=None,
+        execution_status="NOT_EXECUTED",
+        mutation_result=None,
+        postcondition_result=None,
+        workflow_budget_before=budget_snapshot,
+        workflow_budget_after=budget_snapshot,
+    )
+    append_audit_event(audit_event)
+
+    return EnforcementResult(
+        verdict="BLOCK",
+        risk_score=risk_score,
+        risk_factors=[],
+        triggered_rules=triggered_rules,
+        missing_requirements=missing_requirements,
+        suggested_repairs=[],
+        executed=False,
+        audit_event_id=event_id,
+    )
+
+
+def guarded_delete_users(
+    action_context: ActionContext,
+    inactive_days: int,
+    environment: str | None,
+    rollback_proof: RollbackProof | None,
+) -> EnforcementResult:
+    """Thin compatibility wrapper around guarded_execute("delete_users",
+    ...). Kept so existing callers (app.py, existing tests) never need to
+    change; behaviorally identical to guarded_execute for the same inputs.
+    """
+    return guarded_execute(
+        tool_name="delete_users",
+        action_context=action_context,
+        arguments={"inactive_days": inactive_days, "environment": environment},
+        rollback_proof=rollback_proof,
     )

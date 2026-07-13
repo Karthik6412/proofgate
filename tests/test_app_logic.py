@@ -13,12 +13,19 @@ import json
 from pathlib import Path
 
 from app_logic import (
+    audit_card_fields,
     audit_event_row,
     craft_evidence_display,
+    craft_status_label,
+    ensure_craft_cache_seeded,
     find_audit_event_by_id,
     format_count,
     format_executed,
+    latest_event_by_verdict,
+    nebius_status_label,
+    operations_db_status_label,
     read_audit_rows,
+    recovery_proof_card_fields,
     reset_demo_state,
     triggered_rule_rows,
 )
@@ -26,7 +33,7 @@ from operations.actions import count_rows, preview_delete_users
 from operations.database import WORKING_DB_PATH
 from proofgate.budgets import get_workflow_budget
 from proofgate.core import guarded_delete_users
-from proofgate.models import ActionContext, CraftEvidence, TriggeredRule
+from proofgate.models import ActionContext, CraftEvidence, RollbackProof, TriggeredRule
 
 WORKFLOW_ID = "test-demo-workflow"
 
@@ -336,3 +343,261 @@ def test_format_count_returns_em_dash_for_missing_or_non_numeric():
 def test_format_executed_yes_for_true_no_for_false():
     assert format_executed(True) == "Yes"
     assert format_executed(False) == "No"
+
+
+# ---------------------------------------------------------------------------
+# ensure_craft_cache_seeded
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_craft_cache_seeded_copies_seed_when_cache_missing(tmp_path):
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps({"label": "CRAFT enterprise evidence", "mode": "live"}))
+    cache_path = tmp_path / "nested" / "cache.json"
+
+    copied = ensure_craft_cache_seeded(seed_path=seed_path, cache_path=cache_path)
+
+    assert copied is True
+    assert cache_path.exists()
+    assert json.loads(cache_path.read_text())["label"] == "CRAFT enterprise evidence"
+
+
+def test_ensure_craft_cache_seeded_never_overwrites_existing_cache(tmp_path):
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps({"mode": "live", "marker": "seed"}))
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(json.dumps({"mode": "cached", "marker": "real-run"}))
+
+    copied = ensure_craft_cache_seeded(seed_path=seed_path, cache_path=cache_path)
+
+    assert copied is False
+    assert json.loads(cache_path.read_text())["marker"] == "real-run"
+
+
+def test_ensure_craft_cache_seeded_no_op_when_seed_missing(tmp_path):
+    seed_path = tmp_path / "does-not-exist.json"
+    cache_path = tmp_path / "cache.json"
+
+    copied = ensure_craft_cache_seeded(seed_path=seed_path, cache_path=cache_path)
+
+    assert copied is False
+    assert not cache_path.exists()
+
+
+def test_committed_craft_evidence_seed_file_is_a_valid_craft_evidence():
+    # The actual committed seed file used in production must itself be a
+    # valid, real CraftEvidence document -- not a placeholder.
+    from app_logic import CRAFT_EVIDENCE_SEED_PATH
+    from proofgate.models import CraftEvidence
+
+    raw = json.loads(CRAFT_EVIDENCE_SEED_PATH.read_text())
+    evidence = CraftEvidence.model_validate(raw)
+    assert evidence.authoritative_for_mutation_impact is False
+
+
+# ---------------------------------------------------------------------------
+# Demo status labels (no network calls)
+# ---------------------------------------------------------------------------
+
+
+def test_operations_db_status_label_ready_when_file_exists(tmp_path):
+    db_path = tmp_path / "working.db"
+    db_path.write_text("x")
+    assert operations_db_status_label(db_path) == "Ready"
+
+
+def test_operations_db_status_label_not_initialized_when_missing(tmp_path):
+    assert operations_db_status_label(tmp_path / "missing.db") == "Not initialized"
+
+
+def test_craft_status_label_maps_modes():
+    assert craft_status_label("live") == "Live"
+    assert craft_status_label("cached") == "Cached"
+    assert craft_status_label("unavailable") == "Unavailable"
+    assert craft_status_label(None) == "Unavailable"
+
+
+def test_nebius_status_label_reflects_configuration(monkeypatch):
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "true")
+    monkeypatch.setenv("NEBIUS_API_KEY", "dummy-key")
+    assert nebius_status_label() == "Live (configured)"
+
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "false")
+    assert nebius_status_label() == "Fallback (deterministic)"
+
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "true")
+    monkeypatch.delenv("NEBIUS_API_KEY", raising=False)
+    assert nebius_status_label() == "Fallback (deterministic)"
+
+
+# ---------------------------------------------------------------------------
+# latest_event_by_verdict / audit_card_fields (segfault-fix replacement for
+# st.dataframe/st.table -- these feed the two compact native audit cards)
+# ---------------------------------------------------------------------------
+
+
+def test_latest_event_by_verdict_returns_most_recent_match():
+    rows = [
+        {"verdict": "BLOCK", "event_id": "evt-1"},
+        {"verdict": "ALLOW", "event_id": "evt-2"},
+        {"verdict": "BLOCK", "event_id": "evt-3"},
+    ]
+    assert latest_event_by_verdict(rows, "BLOCK")["event_id"] == "evt-3"
+    assert latest_event_by_verdict(rows, "ALLOW")["event_id"] == "evt-2"
+
+
+def test_latest_event_by_verdict_returns_none_when_no_match():
+    rows = [{"verdict": "BLOCK", "event_id": "evt-1"}]
+    assert latest_event_by_verdict(rows, "ALLOW") is None
+
+
+def test_latest_event_by_verdict_returns_none_for_empty_rows():
+    assert latest_event_by_verdict([], "BLOCK") is None
+
+
+def test_audit_card_fields_returns_only_plain_strings():
+    row = {
+        "verdict": "BLOCK",
+        "affected_count": 10073,
+        "production_affected": 9981,
+        "test_affected": 92,
+        "executed": False,
+        "proof_status": "MISSING",
+        "postcondition_status": None,
+    }
+    fields = audit_card_fields(row)
+
+    assert fields == {
+        "Verdict": "BLOCK",
+        "Affected count": "10073",
+        "Production affected": "9981",
+        "Test affected": "92",
+        "Executed": "No",
+        "Proof status": "MISSING",
+        "Postcondition status": "—",
+    }
+    for value in fields.values():
+        assert isinstance(value, str)
+
+
+def test_audit_card_fields_formats_executed_true_as_yes():
+    row = {
+        "verdict": "ALLOW",
+        "affected_count": 92,
+        "production_affected": 0,
+        "test_affected": 92,
+        "executed": True,
+        "proof_status": "VALID",
+        "postcondition_status": "VERIFIED",
+    }
+    fields = audit_card_fields(row)
+    assert fields["Executed"] == "Yes"
+    assert fields["Postcondition status"] == "VERIFIED"
+
+
+def test_audit_card_fields_handles_none_row_with_all_placeholders():
+    fields = audit_card_fields(None)
+    assert all(value == "—" for value in fields.values())
+    assert set(fields.keys()) == {
+        "Verdict",
+        "Affected count",
+        "Production affected",
+        "Test affected",
+        "Executed",
+        "Proof status",
+        "Postcondition status",
+    }
+
+
+def test_audit_card_fields_no_pydantic_or_nested_objects_leak_through():
+    # Defense-in-depth: even if a caller accidentally passed a row still
+    # containing a nested object under an unrelated key, audit_card_fields
+    # must only ever emit strings for the fixed set of fields it reads.
+    row = {
+        "verdict": "BLOCK",
+        "affected_count": 10073,
+        "production_affected": 9981,
+        "test_affected": 92,
+        "executed": False,
+        "proof_status": "MISSING",
+        "postcondition_status": None,
+        "some_other_nested_field": object(),
+    }
+    fields = audit_card_fields(row)
+    assert all(isinstance(v, str) for v in fields.values())
+
+
+# ---------------------------------------------------------------------------
+# recovery_proof_card_fields (Slice 15: proof verification card)
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_proof_card_fields_with_no_proof_supplied():
+    # The unsafe path passes rollback_proof=None to the real backend --
+    # nothing must be fabricated for snapshot/resource/selector/max-rows.
+    fields = recovery_proof_card_fields("MISSING", None, None)
+    assert fields["Validation status"] == "MISSING"
+    assert fields["Snapshot ID"] == "No rollback proof supplied"
+    assert fields["Protected resource"] == "—"
+    assert fields["Selector hash"] == "—"
+    assert fields["Maximum affected rows"] == "—"
+    assert fields["Snapshot exists"] == "—"
+    assert fields["Resource matches"] == "—"
+    assert fields["Selector hash matches"] == "—"
+    assert fields["Count within approved maximum"] == "—"
+
+
+def test_recovery_proof_card_fields_with_valid_proof_and_checks():
+    proof = RollbackProof(
+        snapshot_id="snap-abc123",
+        resource="users",
+        selector_hash="deadbeef",
+        max_affected_rows=92,
+    )
+    proof_checks = {
+        "snapshot_exists": True,
+        "resource_matches": True,
+        "selector_hash_matches": True,
+        "count_within_approved_maximum": True,
+    }
+    fields = recovery_proof_card_fields("VALID", proof, proof_checks)
+
+    assert fields["Validation status"] == "VALID"
+    assert fields["Snapshot ID"] == "snap-abc123"
+    assert fields["Protected resource"] == "users"
+    assert fields["Selector hash"] == "deadbeef"
+    assert fields["Maximum affected rows"] == "92"
+    assert fields["Snapshot exists"] == "✓"
+    assert fields["Resource matches"] == "✓"
+    assert fields["Selector hash matches"] == "✓"
+    assert fields["Count within approved maximum"] == "✓"
+
+
+def test_recovery_proof_card_fields_marks_failed_checks_with_cross():
+    proof = RollbackProof(
+        snapshot_id="snap-bad",
+        resource="users",
+        selector_hash="mismatched",
+        max_affected_rows=92,
+    )
+    proof_checks = {
+        "snapshot_exists": True,
+        "resource_matches": True,
+        "selector_hash_matches": False,
+        "count_within_approved_maximum": False,
+    }
+    fields = recovery_proof_card_fields("INVALID", proof, proof_checks)
+
+    assert fields["Validation status"] == "INVALID"
+    assert fields["Snapshot exists"] == "✓"
+    assert fields["Resource matches"] == "✓"
+    assert fields["Selector hash matches"] == "✗"
+    assert fields["Count within approved maximum"] == "✗"
+
+
+def test_recovery_proof_card_fields_returns_only_plain_strings():
+    proof = RollbackProof(
+        snapshot_id="snap-abc123", resource="users", selector_hash="deadbeef", max_affected_rows=92
+    )
+    fields = recovery_proof_card_fields("VALID", proof, {"snapshot_exists": True})
+    assert all(isinstance(v, str) for v in fields.values())
