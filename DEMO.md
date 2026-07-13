@@ -816,3 +816,174 @@ identical to Slice 21.
 `app.py`, `app_logic.py`, and the `RELIABLE_DEMO` runtime mode are
 completely untouched by this slice -- confirmed by `git diff --stat --
 app.py app_logic.py` reporting no changes.
+
+## Real automatic rollback (Slice 23)
+
+> ProofGate first verifies that a recovery artifact exists and is bound to
+> the exact irreversible action. Slice 23 then demonstrates that the same
+> verified artifact can actually restore the sandboxed database after a
+> genuine postcondition mismatch.
+
+Prior slices proved a valid recovery proof is *required* before an
+irreversible `delete_users` call can be `ALLOW`ed. They never proved the
+underlying snapshot could actually restore anything. Slice 23 closes that
+gap with a real, trusted restoration operation, wired automatically into
+the existing post-execution pipeline -- no new MCP tool, no agent-facing
+rollback action, no policy/proof/selector-hash/audit-schema changes.
+
+### The real sequence
+
+```text
+Verified recovery artifact
+-> irreversible action ALLOWed
+-> real mutation executes
+-> normal postcondition verification detects a genuine mismatch
+-> trusted restoration runs
+-> independent restoration verification runs
+-> ROLLED_BACK or MANUAL_REVIEW_REQUIRED
+```
+
+### Three distinct steps -- never conflated
+
+- **Recovery proof validation** (`proofgate/proofs.py`, unchanged): before
+  execution, checks the caller-supplied `RollbackProof` against the
+  server-side snapshot metadata -- existence, resource, selector hash,
+  approved row count. This is what makes the original `ALLOW` possible.
+- **Real restoration** (`operations/restoration.py::restore_snapshot`,
+  new): after a genuine mismatch, re-validates the same snapshot (its own
+  integrity and selector binding, independently, a second time) and
+  transactionally syncs the snapshot's `environment='test'` rows back
+  into `operations/working.db`. Never touches `operations/pristine.db`,
+  never restores or inserts a production row, never partially commits --
+  any conflicting existing row aborts the whole transaction.
+- **Independent post-restoration verification**
+  (`proofgate/rollback.py::resolve_final_postcondition`, new): does not
+  trust `restore_snapshot`'s own self-report. It separately recomputes a
+  row-content digest and row counts directly from the snapshot artifact
+  (the authoritative pre-execution state) and compares them against
+  `operations/working.db`'s post-restoration state. Only when that
+  independent comparison agrees does it report `ROLLED_BACK`.
+
+### Automatic rollback eligibility
+
+> Automatic rollback is attempted only after an executed ALLOW for a
+> rollback-capable action with a previously validated recovery artifact.
+
+Concretely, all of the following must hold:
+
+- the verdict was `ALLOW` and the mutation actually executed
+- the tool is rollback-capable (`hard_delete=True` in the registry --
+  currently only `delete_users`; `deactivate_users` is reversible and
+  never carries a recovery proof, so it is never eligible)
+- a valid recovery proof was verified *before* execution
+- the exact validated snapshot identifier is still available
+- normal, unchanged `postcondition.verify_postcondition` returned
+  `MISMATCH`
+
+A `MISMATCH` with no eligible recovery artifact becomes
+`MANUAL_REVIEW_REQUIRED` directly -- no guessed or unrelated restore is
+ever attempted. A `MANUAL_REVIEW_REQUIRED` caused by genuine production
+impact is left as-is (restoration here can never touch a production row
+by construction, so it could never honestly resolve that case).
+
+### The mismatch demonstration flag
+
+```bash
+DEMO_SIMULATE_POSTCONDITION_MISMATCH=true
+```
+
+> The deterministic mismatch mechanism performs a real mutation against
+> the local working database. It does not fabricate a postcondition
+> result.
+
+Off by default. When set, `operations.actions.delete_users` -- after
+completing the caller's own real, predicate-matched deletion -- deletes
+exactly one additional, real test-environment row the caller's selector
+did not target, and honestly folds that real count into the
+`MutationResult` it returns. `postcondition.verify_postcondition` is
+completely unmodified: it detects the resulting mismatch purely because
+the actual affected count genuinely differs from the predicted count, the
+same way it always has. The flag can never target
+`operations/pristine.db`, can never touch a production row, and never
+assigns or mocks `PostconditionResult` directly.
+
+**Why the mismatch can't be a smaller number than reality:** because
+`verify_postcondition` only ever compares the predicted count against the
+mutation's own honestly-reported actual count, a *genuine* mismatch
+necessarily means the real total affected count differs from the
+originally-predicted 92. In this demo that real total is 93 (92 intended
++ 1 demo-injected). Workflow budget honestly reflects that real total
+(93/100) -- rollback itself still adds nothing beyond that and refunds
+nothing. The general, unrelated corrected-delete invariant of 92/100
+(Slices 7-9, exercised without this flag) is unaffected and still holds.
+
+### Budget behavior
+
+> Rollback does not refund workflow budget. The original consequential
+> execution remains charged because it occurred, even when its database
+> effects are later reversed.
+
+`proofgate/budgets.py::record_execution` is untouched. It is called
+exactly once per `guarded_execute` invocation, keyed only on the real
+`MutationResult` the mutation itself returned -- never on
+`PostconditionResult`. Automatic rollback resolves the *status* value
+passed into that one call, not the mutation counts, so:
+
+- a `BLOCK`ed request never consumes budget (unchanged)
+- an `ALLOW`ed, rolled-back execution consumes budget exactly once, equal
+  to the real total mutation (92 in the general case; 93 when the demo
+  flag injected one extra real row)
+- rollback itself consumes zero *additional* budget and refunds zero
+- calling `operations.restoration.restore_snapshot` a second time
+  (idempotent no-op) never touches budget at all -- it is a plain
+  Operations function with no budget awareness
+
+### Audit behavior
+
+No audit schema change. `proofgate/core.py::guarded_execute` already
+computes `postcondition_result` and builds/appends its one `AuditEvent`
+in the same synchronous call; Slice 23 only inserts the rollback
+resolution *between* those two existing steps, so the single audit event
+this call already wrote now honestly carries `ROLLED_BACK` or
+`MANUAL_REVIEW_REQUIRED` in its existing `postcondition_result` field.
+Exactly one enforcement audit event is produced per real MCP submission,
+exactly as before; rollback never appends a second, fake enforcement
+event and never rewrites history.
+
+### Idempotency and conflicts
+
+A second call to `restore_snapshot` with the same snapshot is a safe
+no-op (`ALREADY_RESTORED`): no duplicate rows, no changed rows, no
+budget, no audit event. If an existing row's primary key is present but
+its content genuinely conflicts with the snapshot's copy, the entire
+restoration transaction is rejected (`REJECTED_CONFLICT`) and rolled
+back -- nothing is partially restored, nothing unrelated is overwritten.
+
+### Running the demonstration
+
+```bash
+source .venv/bin/activate
+python scripts/rollback_demo.py
+```
+
+Requires only the local sandbox: no live Nebius, no CRAFT, no
+arguments. The MCP subprocess's own runtime mode is explicitly forced to
+`fallback` in its environment (never `live`), and the mismatch flag is
+enabled only inside that same subprocess environment. The script resets
+the database/audit/workflow state before starting, submits a real
+corrected `delete_users` through the real MCP stdio gateway with a real
+recovery proof, verifies the genuine mismatch/restoration/independent-
+verification sequence end to end, exercises the trusted restore
+function's idempotency a second time, writes a sanitized transcript to
+`artifacts/rollback_demo_<timestamp>.json` (gitignored, contains no
+snapshot paths, database paths, proof payloads, secrets, or raw
+exception traces), and resets the sandbox again after capturing evidence.
+
+### Unaffected by this slice
+
+`app.py`/`app_logic.py`/`RELIABLE_DEMO`, `scripts/agent_loop.py`'s agent
+proposal and repair behavior, the MCP request/response contracts, the
+deterministic policy engine, proof-validation semantics, canonical
+selector hashing, and the tool registry are all completely unchanged.
+Rollback is not, and does not add, an agent-facing MCP tool -- it is
+reachable only through the existing guarded post-execution pipeline.

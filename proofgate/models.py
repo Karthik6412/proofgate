@@ -73,6 +73,38 @@ class ProofValidationResult(BaseModel):
     valid: bool
 
 
+class RestoreResult(BaseModel):
+    """Typed result of one operations.restoration.restore_snapshot call.
+
+    Operations-layer result, not an enforcement verdict -- status values
+    are deliberately disjoint from ALLOW/BLOCK. The restore function that
+    produces this never decides whether ROLLED_BACK/MANUAL_REVIEW_REQUIRED
+    should be reported; that judgment (including independent
+    verification) belongs to proofgate.rollback, which is the only code
+    that reads this result to help decide a final PostconditionResult.
+    """
+
+    attempted: bool
+    success: bool
+    status: Literal[
+        "RESTORED",
+        "ALREADY_RESTORED",
+        "REJECTED_INVALID_SNAPSHOT",
+        "REJECTED_SELECTOR_MISMATCH",
+        "REJECTED_UNSAFE_SCOPE",
+        "REJECTED_CONFLICT",
+        "VERIFICATION_FAILED",
+        "FAILED",
+    ]
+    restored_count: int
+    test_rows_restored: int
+    production_rows_restored: int
+    already_present_count: int
+    conflict_count: int
+    verification_passed: bool
+    failure_category: str | None = None
+
+
 class PostconditionResult(BaseModel):
     predicted_count: int
     actual_count: int

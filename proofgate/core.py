@@ -48,6 +48,7 @@ from proofgate.policy import (
 from proofgate.postcondition import verify_postcondition
 from proofgate.proofs import validate_rollback_proof
 from proofgate.registry import get_tool_spec
+from proofgate.rollback import resolve_final_postcondition
 
 # Re-exported so callers/tests can reach per-workflow state through
 # proofgate.core, same as get_workflow_budget/reset_workflow_state.
@@ -157,6 +158,18 @@ def guarded_execute(
     if verdict == "ALLOW":
         mutation_result = spec.mutation_fn(**arguments)
         postcondition_result = verify_postcondition(impact, mutation_result)
+        # Slice 23: resolve MISMATCH into ROLLED_BACK or
+        # MANUAL_REVIEW_REQUIRED via one bounded, trusted automatic
+        # restoration attempt, before budget/audit ever see the result.
+        # A no-op for VERIFIED and for the pre-existing production-impact
+        # MANUAL_REVIEW_REQUIRED case.
+        postcondition_result = resolve_final_postcondition(
+            spec=spec,
+            rollback_proof=rollback_proof,
+            rollback_proof_valid=rollback_proof_valid,
+            selector_arguments=selector_arguments,
+            postcondition_result=postcondition_result,
+        )
         record_execution(action_context.workflow_id, mutation_result, postcondition_result)
         executed = True
 

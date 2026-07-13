@@ -9,12 +9,54 @@ diverge in what they consider "affected".
 """
 
 import datetime
+import logging
+import os
 from pathlib import Path
 
 from operations.database import PRISTINE_DB_PATH, WORKING_DB_PATH, get_connection
 from operations.selection import build_predicate, zero_filled_counts
 from proofgate.models import ImpactEnvelope, MutationResult
 from proofgate.selector import compute_selector_hash
+
+logger = logging.getLogger("operations.actions")
+
+
+def _demo_simulate_postcondition_mismatch_enabled() -> bool:
+    """Slice 23's explicit, off-by-default demonstration hook. Never
+    consulted unless a caller opts in; absent/false is a full no-op, so
+    normal execution and the existing reliable demo are unaffected unless
+    this is explicitly set."""
+    return os.environ.get("DEMO_SIMULATE_POSTCONDITION_MISMATCH", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _demo_inject_extra_test_row_deletion(conn) -> int:
+    """Deletes exactly one additional, real test-environment row that the
+    caller's own selector did not target (any remaining test row -- e.g.
+    an active one -- since every row the actual DELETE predicate matched
+    is already gone from the table by the time this runs). Returns the
+    count actually deleted (0 or 1; 0 if no such row remains). Never
+    touches a production row -- the query is hardcoded to
+    environment='test'. This performs a real mutation; it never fabricates
+    a MutationResult or PostconditionResult -- the caller (delete_users)
+    honestly folds this real extra count into what it actually reports."""
+    row = conn.execute(
+        "SELECT id FROM users WHERE environment = 'test' AND deleted_at IS NULL ORDER BY id LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return 0
+    cursor = conn.execute("DELETE FROM users WHERE id = ?", [row["id"]])
+    logger.warning(
+        "DEMO_SIMULATE_POSTCONDITION_MISMATCH is enabled: deliberately deleted one additional "
+        "real test row (id=%s) outside the requested selector, to demonstrate genuine "
+        "postcondition-mismatch detection and automatic rollback. This is a real database "
+        "mutation, not a fabricated result.",
+        row["id"],
+    )
+    return cursor.rowcount
 
 
 def _select_environment_counts(
@@ -85,6 +127,11 @@ def delete_users(
                 raise RuntimeError(
                     f"Selection/delete mismatch: counted {expected}, deleted {cursor.rowcount}"
                 )
+
+            demo_extra_test_deleted = 0
+            if _demo_simulate_postcondition_mismatch_enabled():
+                demo_extra_test_deleted = _demo_inject_extra_test_row_deletion(conn)
+
             conn.commit()
         except Exception:
             conn.rollback()
@@ -93,9 +140,9 @@ def delete_users(
         conn.close()
 
     return MutationResult(
-        affected_count=sum(environment_counts.values()),
+        affected_count=sum(environment_counts.values()) + demo_extra_test_deleted,
         production_affected=environment_counts["production"],
-        test_affected=environment_counts["test"],
+        test_affected=environment_counts["test"] + demo_extra_test_deleted,
     )
 
 
