@@ -18,11 +18,6 @@ still comes from the same real backend calls as before.
 
 import os
 
-# This slice must not run the live CRAFT OAuth flow -- force cached-only
-# CRAFT evidence regardless of the .env configuration. A later slice can
-# remove this to enable the real live demo path.
-os.environ["CRAFT_LIVE_ENABLED"] = "false"
-
 import streamlit as st
 
 from app_logic import (
@@ -36,6 +31,7 @@ from app_logic import (
     audit_card_fields,
     comparison_markdown_table,
     craft_evidence_display,
+    craft_source_label,
     craft_status_label,
     ensure_craft_cache_seeded,
     find_audit_event_by_id,
@@ -43,6 +39,7 @@ from app_logic import (
     format_executed,
     latest_event_by_verdict,
     mutation_verb_label,
+    nebius_source_label,
     nebius_status_label,
     operations_db_status_label,
     policy_rule_comparison_rows,
@@ -59,6 +56,18 @@ from operations.snapshots import create_snapshot
 from proofgate.audit import DEFAULT_AUDIT_PATH
 from proofgate.core import guarded_delete_users, guarded_execute
 from proofgate.models import ActionContext
+from proofgate.runtime_mode import apply_runtime_mode_to_environment, mode_label
+
+# Slice 20: resolve the centralized runtime mode once at startup and, only
+# for FALLBACK/RELIABLE_DEMO, force the legacy NEBIUS_LIVE_ENABLED /
+# CRAFT_LIVE_ENABLED flags off. For LIVE (the default), this deliberately
+# leaves both flags untouched -- live Nebius/CRAFT are attempted whenever
+# their own existing configuration checks (agent.nebius_client.live_enabled
+# / craft.config.live_enabled, both unchanged) say they're available, and
+# gracefully degrade to deterministic fallback / cached evidence otherwise.
+# This replaces the previous hardcoded `CRAFT_LIVE_ENABLED = "false"` that
+# unconditionally forced CRAFT off regardless of real configuration.
+_RESOLVED_RUNTIME_MODE = apply_runtime_mode_to_environment()
 
 st.set_page_config(page_title="ProofGate", layout="wide")
 
@@ -122,12 +131,14 @@ def _render_governance_and_verdict(result, audit_event: dict | None, rollback_pr
     # (hard_delete False) honestly gets its own reversible-action wording.
     hard_delete = impact.get("hard_delete", True)
     mutation_verb = mutation_verb_label(hard_delete)
+    extraction_mode = (audit_event or {}).get("extraction_mode")
 
     with st.container(border=True):
         info_cols = st.columns([1, 2])
 
         with info_cols[0]:
             st.caption("NEBIUS · semantic extraction — never decides ALLOW/BLOCK")
+            st.caption(f"Source for this call: {nebius_source_label(extraction_mode)}")
             if result.risk_factors:
                 st.markdown(" ".join(f"`{factor}`" for factor in result.risk_factors))
             else:
@@ -258,6 +269,22 @@ if not st.session_state.db_initialized:
 # fallback even on a fresh checkout, without ever running live OAuth.
 ensure_craft_cache_seeded()
 
+# Safety exception, independent of the resolved runtime mode: this call
+# runs unconditionally in the script's top-level body every time the page
+# loads (Streamlit re-executes the whole script), which for a fresh
+# process is functionally equivalent to "at import" -- and CRAFT's OAuth
+# (craft/auth.py) has no cross-process token cache, opens a real browser
+# window, and would otherwise fire automatically the first time anyone
+# merely starts the app with real CRAFT credentials configured. That
+# would violate this project's "no network calls / OAuth during import"
+# invariant (verified empirically: with this repo's own .env configured,
+# `import app` in LIVE mode does reach craft.client.run_craft_workflow).
+# So this one automatic call always uses cached/fallback evidence,
+# regardless of PROOFGATE_RUNTIME_MODE -- Nebius has no such import-time
+# trigger (it only runs on an explicit button click below) and is not
+# restricted this way.
+os.environ["CRAFT_LIVE_ENABLED"] = "false"
+
 if st.session_state.craft_outcome is None and st.session_state.craft_error is None:
     try:
         st.session_state.craft_outcome = prepare_craft_evidence(WORKFLOW_ID, FIXED_INSTRUCTION)
@@ -298,12 +325,14 @@ if st.session_state.just_reset:
     st.session_state.just_reset = False
 
 craft_mode = st.session_state.craft_outcome.mode if st.session_state.craft_outcome else None
-status_cols = st.columns(5)
-status_cols[0].caption(f"**Operations DB:** {operations_db_status_label(WORKING_DB_PATH)}")
-status_cols[1].caption("**Deterministic policy:** Active")
-status_cols[2].caption("**Audit log:** Active")
-status_cols[3].caption(f"**CRAFT evidence:** {craft_status_label(craft_mode)}")
-status_cols[4].caption(f"**Nebius extraction:** {nebius_status_label()}")
+craft_error_summary = st.session_state.craft_outcome.error_summary if st.session_state.craft_outcome else None
+status_cols = st.columns(6)
+status_cols[0].caption(f"**Runtime mode:** {mode_label(_RESOLVED_RUNTIME_MODE)}")
+status_cols[1].caption(f"**Operations DB:** {operations_db_status_label(WORKING_DB_PATH)}")
+status_cols[2].caption("**Deterministic policy:** Active")
+status_cols[3].caption("**Audit log:** Active")
+status_cols[4].caption(f"**CRAFT evidence:** {craft_source_label(craft_mode, craft_error_summary)}")
+status_cols[5].caption(f"**Nebius extraction:** {nebius_status_label()}")
 
 st.divider()
 

@@ -16,14 +16,31 @@ for RULE_INTENT_BOUNDARY/RULE_WORKFLOW_BUDGET, never RiskFeatures.
 """
 
 import json
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from proofgate.models import ImpactEnvelope, IntentConstraints, RiskFeatures
+
+logger = logging.getLogger("agent.nebius_client")
+
+
+def _configure_logging() -> None:
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+_configure_logging()
 
 try:
     from dotenv import load_dotenv
@@ -182,11 +199,21 @@ def _canonicalize_target_resource(value: str) -> str:
 @dataclass
 class ExtractionOutcome:
     """Internal runtime metadata, not a wire contract -- a dataclass is
-    fine here. value is always one of the existing Pydantic contracts."""
+    fine here. value is always one of the existing Pydantic contracts.
+
+    degraded_reason (Slice 20) honestly distinguishes why mode fell back
+    to "deterministic_fallback": no attempt was made because live wasn't
+    configured/enabled ("missing_configuration"), a live attempt failed
+    to reach or parse a response ("upstream_failure"), or a live response
+    was received but failed schema/business validation
+    ("invalid_response"). None when mode == "nebius_live", or when the
+    caller passed an explicit test client (should_attempt was true for
+    reasons other than live configuration)."""
 
     value: IntentConstraints | RiskFeatures
     mode: Literal["nebius_live", "deterministic_fallback"]
     model: str | None
+    degraded_reason: Literal["missing_configuration", "upstream_failure", "invalid_response"] | None = None
 
 
 def live_enabled() -> bool:
@@ -301,10 +328,31 @@ def _call_nebius_json(client, system_prompt: str, user_prompt: str, model_name: 
     return raw
 
 
+_SECRET_MARKERS = ("authorization:", "bearer ", "api_key", "apikey", "token=", "sk-")
+
+
+def _sanitize_exception_message(exc: Exception) -> str:
+    """Concise, secret-safe summary for a stderr degradation log -- never
+    a full traceback, never a raw header/token value."""
+    text = str(exc)
+    lowered = text.lower()
+    if any(marker in lowered for marker in _SECRET_MARKERS):
+        return "(details withheld to avoid leaking credentials)"
+    return text[:200]
+
+
+def _degraded_reason_for(exc: Exception) -> Literal["upstream_failure", "invalid_response"]:
+    if isinstance(exc, (ValidationError, ValueError)):
+        return "invalid_response"
+    return "upstream_failure"
+
+
 def extract_intent_live_or_fallback(instruction: str, client=None) -> ExtractionOutcome:
     """Attempt live Nebius intent extraction; fall back to the
     deterministic extractor on any failure. Never raises."""
     should_attempt = client is not None or (live_enabled() and has_api_key())
+    degraded_reason: Literal["missing_configuration", "upstream_failure", "invalid_response"] | None = None
+
     if should_attempt:
         try:
             active_client = client or _build_client()
@@ -326,11 +374,24 @@ def extract_intent_live_or_fallback(instruction: str, client=None) -> Extraction
                 confidence=validated.confidence,
             )
             return ExtractionOutcome(value=intent, mode="nebius_live", model=model_name)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 -- any failure must fall back, never crash
+            degraded_reason = _degraded_reason_for(exc)
+            logger.warning(
+                "Nebius live intent extraction failed (%s); falling back to deterministic "
+                "extraction: %s",
+                degraded_reason,
+                _sanitize_exception_message(exc),
+            )
+    else:
+        # should_attempt is False only when client is None and live Nebius
+        # isn't configured/enabled -- no attempt was made at all.
+        degraded_reason = "missing_configuration"
 
     return ExtractionOutcome(
-        value=extract_intent(instruction), mode="deterministic_fallback", model=None
+        value=extract_intent(instruction),
+        mode="deterministic_fallback",
+        model=None,
+        degraded_reason=degraded_reason,
     )
 
 
@@ -344,6 +405,8 @@ def extract_risk_features_live_or_fallback(
     """Attempt live Nebius risk-feature extraction; fall back to the
     deterministic extractor on any failure. Never raises."""
     should_attempt = client is not None or (live_enabled() and has_api_key())
+    degraded_reason: Literal["missing_configuration", "upstream_failure", "invalid_response"] | None = None
+
     if should_attempt:
         try:
             active_client = client or _build_client()
@@ -370,11 +433,20 @@ def extract_risk_features_live_or_fallback(
                 rationale=validated.rationale,
             )
             return ExtractionOutcome(value=risk, mode="nebius_live", model=model_name)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 -- any failure must fall back, never crash
+            degraded_reason = _degraded_reason_for(exc)
+            logger.warning(
+                "Nebius live risk-feature extraction failed (%s); falling back to "
+                "deterministic extraction: %s",
+                degraded_reason,
+                _sanitize_exception_message(exc),
+            )
+    else:
+        degraded_reason = "missing_configuration"
 
     return ExtractionOutcome(
         value=extract_risk_features(intent, proposed_arguments, impact),
         mode="deterministic_fallback",
         model=None,
+        degraded_reason=degraded_reason,
     )

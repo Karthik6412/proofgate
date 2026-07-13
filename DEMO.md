@@ -13,15 +13,92 @@ Opens at `http://localhost:8501`.
 
 - Python virtual environment at `.venv/` with project dependencies installed
   (`pyproject.toml`): `pydantic`, `openai`, `python-dotenv`, `mcp`, `streamlit`.
-- A `.env` file at the repo root with `NEBIUS_API_KEY` (optional — the app
-  falls back to deterministic intent/risk extraction if absent or if the
-  live call fails).
-- No `CRAFT_PROJECT_ID` / CRAFT OAuth setup is required for the demo. The app
-  forces `CRAFT_LIVE_ENABLED=false` at startup and always uses the committed,
-  previously-retrieved evidence in `demo_seed/craft_evidence_seed.json`,
-  auto-copied into the runtime cache (`artifacts/craft_evidence_cache.json`)
-  on first launch if that cache file doesn't already exist.
-- No login, no deployment, no external services required to demo locally.
+- A `.env` file at the repo root with `NEBIUS_API_KEY` (optional) and, if you
+  want live CRAFT, `CRAFT_PROJECT_ID` (optional). Both are genuinely
+  optional: see "Runtime modes" below for exactly what happens with or
+  without them.
+- No login, no deployment, no external services required to demo locally
+  (`PROOFGATE_RUNTIME_MODE=fallback` or `=reliable_demo` guarantee this).
+
+## Runtime modes (Slice 20)
+
+ProofGate resolves one of three runtime modes per process, centralized in
+`proofgate/runtime_mode.py`, used identically by both `app.py` and
+`proofgate/mcp_server.py`:
+
+| Mode | Behavior |
+|---|---|
+| `live` (**default**) | Prefer live Nebius and live CRAFT when configured; degrade honestly (never crash) on missing credentials or upstream failure. |
+| `fallback` | Never attempt live Nebius or live CRAFT. Deterministic intent extraction + committed/cached CRAFT evidence only. Used automatically by the test suite. |
+| `reliable_demo` | Same offline guarantee as `fallback`, intended for a judged/recorded demo where the exact click path and counts must never depend on network availability. |
+
+Set it explicitly with:
+
+```bash
+PROOFGATE_RUNTIME_MODE=live streamlit run app.py
+PROOFGATE_RUNTIME_MODE=fallback streamlit run app.py
+PROOFGATE_RUNTIME_MODE=reliable_demo streamlit run app.py
+```
+
+or, for the MCP gateway:
+
+```bash
+PROOFGATE_RUNTIME_MODE=fallback python -m proofgate.mcp_server
+```
+
+With no explicit `PROOFGATE_RUNTIME_MODE`, mode resolves from the legacy
+per-integration flags (`NEBIUS_LIVE_ENABLED`, `CRAFT_LIVE_ENABLED`,
+`DEMO_RELIABLE_MODE`) if any are set — deprecated, logged once to stderr,
+kept only for backward compatibility — else defaults to `live`.
+Contradictory legacy flags (e.g. `NEBIUS_LIVE_ENABLED=true` with
+`CRAFT_LIVE_ENABLED=false`, with no `PROOFGATE_RUNTIME_MODE` set) are
+rejected with a clear error rather than guessed at.
+
+**"Live" means live-preferred, not live-required.** `live` mode with no
+`.env` configured at all runs fully offline with zero network calls —
+missing credentials cause an immediate, silent-to-the-user degrade to
+deterministic/cached behavior, logged once to stderr.
+
+**One safety exception, independent of mode:** the Streamlit page's CRAFT
+evidence panel is populated automatically, unconditionally, every time the
+page loads (Streamlit re-executes the whole script on each run). CRAFT's
+OAuth flow opens a real browser window and caches no token across
+processes, so — verified empirically during Slice 20 — restoring true
+live-by-default for *that specific automatic call* would make a fresh
+`streamlit run app.py` attempt a real OAuth popup merely from starting the
+app, if `CRAFT_PROJECT_ID` happens to be configured. `app.py` therefore
+always forces that one call to cached/fallback evidence, in every mode.
+Nebius has no equivalent import-time trigger (it only runs when you click
+a governed action button) and is not restricted this way. See
+`tests/test_app_import.py::test_importing_app_never_attempts_a_live_craft_call_even_with_real_env_credentials`.
+
+**Test isolation:** `tests/conftest.py`'s autouse fixtures force
+`PROOFGATE_RUNTIME_MODE=fallback` (plus the legacy flags, plus clearing
+`NEBIUS_API_KEY`/`CRAFT_PROJECT_ID`) for every test. No test depends on a
+developer remembering to export anything, and no test makes a real network
+call regardless of what's in your own `.env`.
+
+**Integration-source honesty:** every guarded call's audit event (and, for
+delete/deactivate, the governance card in the UI, and the MCP response's
+`extraction_mode` field) records the *actual* source for that call —
+`nebius_live`, `mixed`, or `deterministic_fallback` — never a static
+pre-call guess, and fallback output is never labeled live.
+
+**Timeouts, retries, failure classes:** Nebius's OpenAI-compatible client
+uses a 10s timeout; CRAFT's MCP client uses a 25s tool-call timeout and a
+separate 180s OAuth-consent timeout (both pre-existing, unchanged). A
+failed live attempt degrades once to deterministic/cached output — this
+slice does not add automatic retries of the live call or of any
+consequential mutation. Three failure classes are distinguished internally
+(exposed via CRAFT's `error_summary` and Nebius's `degraded_reason`, an
+internal field, not part of the audit schema): missing configuration
+(no attempt made), upstream failure (attempted, network/API error), and
+invalid response (attempted, received but failed validation).
+
+**Secrets:** never logged, never returned in UI/MCP output. Both
+integrations' error-summarization redacts anything that looks like an
+`Authorization:`/`Bearer `/`api_key`/token value before it reaches a log
+line, UI caption, or MCP response.
 
 ## Page layout (Slice 15 redesign, extended in Slice 18)
 
@@ -221,9 +298,11 @@ they remain exactly as they were before this slice.
 
 ## Cached CRAFT behavior
 
-`CRAFT_LIVE_ENABLED=false` is forced at the top of `app.py`. No OAuth flow
-ever runs during the demo. The **"CRAFT enterprise context"** panel (near
-the top of the page, just under "User instruction") always shows:
+The Streamlit page's automatic CRAFT evidence panel always uses
+cached/fallback evidence, in every runtime mode (see "Runtime modes"
+above for why) — no OAuth flow ever runs from merely opening the page.
+The **"CRAFT enterprise context"** panel (near the top of the page, just
+under "User instruction") always shows:
 
 - Label: **"Previously retrieved CRAFT evidence"**
 - Mode: **cached**
@@ -374,6 +453,21 @@ Rejected before the guarded pipeline ever runs: unknown/misspelled fields
 (e.g. `enviroment`), non-numeric strings (`"ninety"`), negative or zero
 `inactive_days`, floating-point thresholds, unsupported environment
 aliases (e.g. `"testing"`), and any omitted required field.
+
+### Runtime mode (Slice 20)
+
+The MCP gateway resolves and applies the same centralized runtime mode as
+Streamlit (`proofgate.runtime_mode.apply_runtime_mode_to_environment()`,
+called once at import time -- an environment-variable resolution only, no
+network call). In `live` mode, a guarded call's Nebius extraction may be
+attempted live and degrades gracefully on failure, exactly as it does for
+Streamlit; the MCP gateway never calls CRAFT at all (CRAFT integration is
+out of scope for MCP tool handlers), so there is no equivalent CRAFT
+concern here. The resolved mode is logged once to stderr at startup. The
+per-call response additionally includes `extraction_mode` and
+`nebius_model` -- additive, backward-compatible fields already present on
+the audit event this call wrote; BLOCK and ALLOW responses still share one
+identical key set.
 
 ### Concurrency, queueing, and shutdown
 

@@ -28,7 +28,10 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 pytestmark = pytest.mark.usefixtures(
-    "_isolate_audit_log", "_disable_live_nebius_by_default", "_isolate_craft_by_default"
+    "_isolate_audit_log",
+    "_disable_live_nebius_by_default",
+    "_isolate_craft_by_default",
+    "_force_fallback_runtime_mode",
 )
 
 
@@ -164,3 +167,38 @@ def test_full_two_tool_click_through_and_reset():
     assert get_workflow_budget("demo-workflow").rows_mutated == 0
     assert get_workflow_budget("deactivate-demo-workflow").rows_mutated == 0
     assert count_rows(WORKING_DB_PATH) == 10623
+
+
+# ---------------------------------------------------------------------------
+# Slice 20: runtime-mode visibility
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_mode_and_integration_source_are_visible(monkeypatch):
+    from operations.database import reset_working_db
+    from proofgate.budgets import reset_workflow_state
+
+    monkeypatch.setenv("PROOFGATE_RUNTIME_MODE", "fallback")
+    reset_working_db()
+    reset_workflow_state("demo-workflow")
+    reset_workflow_state("deactivate-demo-workflow")
+
+    at = AppTest.from_file("app.py", default_timeout=30)
+    at.run()
+    assert not at.exception
+
+    captions_before = "\n".join(c.value for c in at.caption)
+    assert "Runtime mode" in captions_before
+    assert "Fallback" in captions_before
+
+    _click(at, "Run unsafe agent action")
+    assert not at.exception
+    captions_after = "\n".join(c.value for c in at.caption)
+    assert "Source for this call" in captions_after
+    assert "Fallback (deterministic)" in captions_after
+    # Never mislabel deterministic fallback output as live.
+    assert "Source for this call: Live" not in captions_after
+
+    reset_working_db()
+    reset_workflow_state("demo-workflow")
+    reset_workflow_state("deactivate-demo-workflow")

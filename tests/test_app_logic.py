@@ -18,6 +18,7 @@ from app_logic import (
     audit_event_row,
     comparison_markdown_table,
     craft_evidence_display,
+    craft_source_label,
     craft_status_label,
     ensure_craft_cache_seeded,
     find_audit_event_by_id,
@@ -25,6 +26,7 @@ from app_logic import (
     format_executed,
     latest_event_by_verdict,
     mutation_verb_label,
+    nebius_source_label,
     nebius_status_label,
     operations_db_status_label,
     policy_rule_comparison_rows,
@@ -805,3 +807,56 @@ def test_delete_and_deactivate_corrected_workflows_are_isolated_and_both_report_
     reset_deactivate_demo_state(DEACTIVATE_WORKFLOW_ID)
     assert get_workflow_budget(WORKFLOW_ID).rows_mutated == 0
     assert get_workflow_budget(DEACTIVATE_WORKFLOW_ID).rows_mutated == 0
+
+
+# ---------------------------------------------------------------------------
+# Slice 20: honest per-call integration-source labels
+# ---------------------------------------------------------------------------
+
+
+def test_nebius_source_label_not_yet_called():
+    assert nebius_source_label(None) == "Not yet called"
+
+
+def test_nebius_source_label_live():
+    assert nebius_source_label("nebius_live") == "Live"
+
+
+def test_nebius_source_label_mixed():
+    assert nebius_source_label("mixed") == "Mixed (partial live)"
+
+
+def test_nebius_source_label_fallback():
+    assert nebius_source_label("deterministic_fallback") == "Fallback (deterministic)"
+
+
+def test_nebius_source_label_unknown_value_is_labeled_unknown_not_fabricated_as_live():
+    assert nebius_source_label("something_new") == "Unknown"
+
+
+def test_craft_source_label_not_yet_called():
+    assert craft_source_label(None) == "Not yet called"
+
+
+def test_craft_source_label_live():
+    assert craft_source_label("live") == "Live"
+
+
+def test_craft_source_label_cached_without_error_summary_is_not_configured():
+    assert craft_source_label("cached", None) == "Cached (not configured for live)"
+
+
+def test_craft_source_label_cached_with_error_summary_is_live_attempt_failed():
+    assert craft_source_label("cached", "[execute_query] TimeoutError: simulated") == (
+        "Fallback (live attempt failed)"
+    )
+
+
+def test_craft_source_label_unavailable():
+    assert craft_source_label("unavailable") == "Unavailable"
+
+
+def test_craft_source_label_never_reports_cached_as_live():
+    # Regression guard for the core "never mislabel fallback as live" rule.
+    assert craft_source_label("cached", "any failure") != "Live"
+    assert craft_source_label("cached", None) != "Live"

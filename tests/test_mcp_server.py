@@ -729,3 +729,149 @@ def test_stdio_protocol_integrity_real_subprocess():
             real_audit_path.write_text(backup_content)
         elif real_audit_path.exists():
             real_audit_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Slice 20: runtime-mode behavior
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_module_imports_safely_in_all_three_modes(monkeypatch):
+    for value in ("live", "fallback", "reliable_demo"):
+        result = subprocess.run(
+            [sys.executable, "-c", "import proofgate.mcp_server"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                "PROOFGATE_RUNTIME_MODE": value,
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+        assert result.returncode == 0, f"mode={value}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+def test_mcp_response_includes_extraction_mode_metadata():
+    workflow_id = "mcp-extraction-mode-field"
+    _clean_state(workflow_id)
+
+    result = _run(
+        _call(
+            "delete_users",
+            {"instruction": DELETE_INSTRUCTION, "workflow_id": workflow_id, "inactive_days": 90},
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent["extraction_mode"] == "deterministic_fallback"
+    assert "nebius_model" in result.structuredContent
+
+
+def test_mcp_fallback_mode_never_calls_live_nebius(monkeypatch):
+    import agent.nebius_client as nebius_client_module
+
+    monkeypatch.setenv("PROOFGATE_RUNTIME_MODE", "fallback")
+    monkeypatch.setenv("NEBIUS_API_KEY", "dummy-key")
+
+    def _explode():
+        raise AssertionError("must not construct a real Nebius client in fallback mode")
+
+    monkeypatch.setattr(nebius_client_module, "_build_client", _explode)
+
+    workflow_id = "mcp-fallback-no-live"
+    _clean_state(workflow_id)
+    result = _run(
+        _call(
+            "delete_users",
+            {"instruction": DELETE_INSTRUCTION, "workflow_id": workflow_id, "inactive_days": 90},
+        )
+    )
+    assert result.isError is False
+    assert result.structuredContent["extraction_mode"] == "deterministic_fallback"
+
+
+def test_mcp_reliable_demo_mode_never_calls_live_nebius(monkeypatch):
+    import agent.nebius_client as nebius_client_module
+
+    monkeypatch.setenv("PROOFGATE_RUNTIME_MODE", "reliable_demo")
+    monkeypatch.setenv("NEBIUS_API_KEY", "dummy-key")
+
+    def _explode():
+        raise AssertionError("must not construct a real Nebius client in reliable_demo mode")
+
+    monkeypatch.setattr(nebius_client_module, "_build_client", _explode)
+
+    workflow_id = "mcp-reliable-demo-no-live"
+    _clean_state(workflow_id)
+    result = _run(
+        _call(
+            "deactivate_users",
+            {"instruction": DEACTIVATE_INSTRUCTION, "workflow_id": workflow_id, "inactive_days": 90},
+        )
+    )
+    assert result.isError is False
+    assert result.structuredContent["extraction_mode"] == "deterministic_fallback"
+
+
+def test_mcp_live_mode_upstream_failure_still_returns_structured_result(monkeypatch):
+    """LIVE mode + a live Nebius client that raises must still produce a
+    real, structured ProofGate BLOCK -- never a transport failure, never a
+    fabricated ALLOW."""
+    import agent.nebius_client as nebius_client_module
+
+    monkeypatch.setenv("PROOFGATE_RUNTIME_MODE", "live")
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "true")
+    monkeypatch.setenv("NEBIUS_API_KEY", "dummy-key")
+
+    def _explode():
+        raise ConnectionError("simulated upstream failure")
+
+    monkeypatch.setattr(nebius_client_module, "_build_client", _explode)
+
+    workflow_id = "mcp-live-failure-fallback"
+    _clean_state(workflow_id)
+    before_events = len(_audit_events())
+
+    result = _run(
+        _call(
+            "delete_users",
+            {"instruction": DELETE_INSTRUCTION, "workflow_id": workflow_id, "inactive_days": 90},
+        )
+    )
+
+    assert result.isError is False
+    content = result.structuredContent
+    assert content["verdict"] == "BLOCK"
+    assert content["extraction_mode"] == "deterministic_fallback"
+    assert {r["rule_id"] for r in content["triggered_rules"]} == {
+        "RULE_INTENT_BOUNDARY",
+        "RULE_RECOVERY_PROOF",
+        "RULE_WORKFLOW_BUDGET",
+    }
+    assert len(_audit_events()) == before_events + 1
+
+
+def test_mcp_response_never_leaks_secret_values_under_live_failure(monkeypatch):
+    import agent.nebius_client as nebius_client_module
+
+    monkeypatch.setenv("PROOFGATE_RUNTIME_MODE", "live")
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "true")
+    monkeypatch.setenv("NEBIUS_API_KEY", "sk-should-never-appear-anywhere")
+
+    def _explode():
+        raise RuntimeError("Authorization: Bearer sk-should-never-appear-anywhere rejected")
+
+    monkeypatch.setattr(nebius_client_module, "_build_client", _explode)
+
+    workflow_id = "mcp-no-secret-leak"
+    _clean_state(workflow_id)
+    result = _run(
+        _call(
+            "delete_users",
+            {"instruction": DELETE_INSTRUCTION, "workflow_id": workflow_id, "inactive_days": 90},
+        )
+    )
+
+    dumped = json.dumps(result.structuredContent)
+    assert "sk-should-never-appear-anywhere" not in dumped

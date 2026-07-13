@@ -531,3 +531,105 @@ def test_no_real_client_constructed_when_live_disabled_by_default(monkeypatch):
     # Completed normally without ever reaching _build_client -- conftest.py's
     # default NEBIUS_LIVE_ENABLED=false / no API key kept the live path shut.
     assert result.verdict == "BLOCK"
+
+
+# ---------------------------------------------------------------------------
+# Slice 20: degraded_reason -- honestly distinguishes *why* mode fell back
+# to deterministic_fallback (missing_configuration / upstream_failure /
+# invalid_response), and a live success carries no degraded_reason at all.
+# ---------------------------------------------------------------------------
+
+
+def test_live_success_has_no_degraded_reason():
+    client = FakeNebiusClient(content=VALID_INTENT_JSON)
+    outcome = extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert outcome.mode == "nebius_live"
+    assert outcome.degraded_reason is None
+
+
+def test_missing_configuration_degraded_reason(monkeypatch):
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "false")
+    monkeypatch.setenv("NEBIUS_API_KEY", "dummy-key")
+
+    outcome = extract_intent_live_or_fallback(BROAD_INSTRUCTION)
+
+    assert outcome.mode == "deterministic_fallback"
+    assert outcome.degraded_reason == "missing_configuration"
+
+
+def test_upstream_failure_degraded_reason_for_network_exception():
+    client = FakeNebiusClient(exception=ConnectionError("simulated network failure"))
+    outcome = extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert outcome.mode == "deterministic_fallback"
+    assert outcome.degraded_reason == "upstream_failure"
+
+
+def test_upstream_failure_degraded_reason_for_timeout():
+    client = FakeNebiusClient(exception=TimeoutError("simulated timeout"))
+    outcome = extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert outcome.degraded_reason == "upstream_failure"
+
+
+def test_invalid_response_degraded_reason_for_malformed_json():
+    client = FakeNebiusClient(content="{not valid json at all")
+    outcome = extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert outcome.degraded_reason == "invalid_response"
+
+
+def test_invalid_response_degraded_reason_for_unsupported_environment():
+    payload = dict(VALID_INTENT_PAYLOAD, environment="production_and_test")
+    client = FakeNebiusClient(content=json.dumps(payload))
+    outcome = extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert outcome.mode == "deterministic_fallback"
+    assert outcome.degraded_reason == "invalid_response"
+
+
+def test_risk_extraction_degraded_reason_missing_configuration(monkeypatch):
+    monkeypatch.setenv("NEBIUS_LIVE_ENABLED", "false")
+    intent = extract_intent(BROAD_INSTRUCTION)
+    impact = _broad_impact()
+
+    outcome = extract_risk_features_live_or_fallback(
+        BROAD_INSTRUCTION, intent, {"inactive_days": 90, "environment": None}, impact
+    )
+
+    assert outcome.mode == "deterministic_fallback"
+    assert outcome.degraded_reason == "missing_configuration"
+
+
+def test_degradation_never_writes_to_stdout(capsys):
+    # agent.nebius_client configures its logger's stream handler once at
+    # module-import time, so pytest's capsys (which swaps sys.stderr only
+    # for the duration of one test) cannot observe writes to that already-
+    # bound stream object -- caplog is used below to verify the log
+    # *content* instead. This assertion still meaningfully proves stdout
+    # itself was never touched, which is the actual stdio-hygiene concern.
+    client = FakeNebiusClient(exception=ConnectionError("simulated network failure"))
+    extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_degradation_is_logged_with_reason_and_message(caplog):
+    with caplog.at_level("WARNING", logger="agent.nebius_client"):
+        client = FakeNebiusClient(exception=ConnectionError("simulated network failure"))
+        extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert "upstream_failure" in caplog.text
+    assert "simulated network failure" in caplog.text
+
+
+def test_degradation_log_redacts_secret_looking_messages(caplog):
+    with caplog.at_level("WARNING", logger="agent.nebius_client"):
+        client = FakeNebiusClient(
+            exception=RuntimeError("Authorization: Bearer sk-supersecrettoken123 rejected")
+        )
+        extract_intent_live_or_fallback(BROAD_INSTRUCTION, client=client)
+
+    assert "sk-supersecrettoken123" not in caplog.text
+    assert "withheld" in caplog.text.lower()

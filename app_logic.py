@@ -397,3 +397,45 @@ def comparison_markdown_table(rows: list[dict[str, str]]) -> str:
     for row in rows:
         lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Slice 20: honest per-call integration-source labels. Both read only
+# already-computed real outcome data (an AuditEvent's extraction_mode, or a
+# real CraftEvidenceOutcome's mode/error_summary) -- neither ever performs
+# a live call itself, and neither ever labels fallback/cached output as
+# live.
+# ---------------------------------------------------------------------------
+
+
+def nebius_source_label(extraction_mode: str | None) -> str:
+    """Judge-readable label for the actual Nebius extraction source of one
+    specific call, read from that call's real AuditEvent.extraction_mode
+    field -- never a static pre-call guess. "Not yet called" before any
+    guarded call has produced an audit event."""
+    return {
+        None: "Not yet called",
+        "nebius_live": "Live",
+        "mixed": "Mixed (partial live)",
+        "deterministic_fallback": "Fallback (deterministic)",
+    }.get(extraction_mode, "Unknown")
+
+
+def craft_source_label(mode: str | None, error_summary: str | None = None) -> str:
+    """Judge-readable label for the actual CRAFT evidence source, read
+    from a real CraftEvidenceOutcome's mode/error_summary -- never a
+    static pre-call guess. error_summary is only ever non-None when a
+    live attempt was actually made and failed (see
+    craft.evidence.prepare_craft_evidence), which is what distinguishes a
+    cached result that never attempted live (no configuration) from one
+    where a live attempt genuinely failed.
+    """
+    if mode is None:
+        return "Not yet called"
+    if mode == "live":
+        return "Live"
+    if mode == "cached":
+        return "Fallback (live attempt failed)" if error_summary else "Cached (not configured for live)"
+    if mode == "unavailable":
+        return "Unavailable"
+    return "Unknown"

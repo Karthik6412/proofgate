@@ -120,6 +120,7 @@ import proofgate.audit as audit_module
 from proofgate.core import guarded_execute
 from proofgate.models import ActionContext, RollbackProof
 from proofgate.registry import registered_tool_names
+from proofgate.runtime_mode import apply_runtime_mode_to_environment, mode_label
 
 logger = logging.getLogger("proofgate.mcp_server")
 
@@ -184,6 +185,16 @@ def _assert_registry_matches_public_surface() -> None:
 
 
 _assert_registry_matches_public_surface()
+
+# Slice 20: resolve the centralized runtime mode once at import/startup and,
+# only for FALLBACK/RELIABLE_DEMO, force the legacy NEBIUS_LIVE_ENABLED /
+# CRAFT_LIVE_ENABLED flags off (mirrors app.py's identical call). For LIVE,
+# this deliberately leaves both flags untouched: guarded_execute's own
+# Nebius extraction call already attempts live and degrades gracefully
+# exactly as it does for Streamlit; this gateway never calls CRAFT at all
+# (CRAFT integration is out of scope for MCP tool handlers). No network
+# call happens here -- only an environment-variable resolution.
+_RESOLVED_RUNTIME_MODE = apply_runtime_mode_to_environment()
 
 # ---------------------------------------------------------------------------
 # Part D: explicit, narrow input-normalization policy.
@@ -339,6 +350,11 @@ def _serialize_result(tool_name: str, result) -> dict[str, Any]:
     payload["mutation_result"] = audit_event.get("mutation_result")
     payload["postcondition_result"] = audit_event.get("postcondition_result")
     payload["workflow_budget"] = audit_event.get("workflow_budget_after")
+    # Slice 20: additive, backward-compatible integration-source metadata --
+    # both fields already existed on the AuditEvent this call already
+    # wrote; BLOCK and ALLOW responses still share one identical key set.
+    payload["extraction_mode"] = audit_event.get("extraction_mode")
+    payload["nebius_model"] = audit_event.get("nebius_model")
     return payload
 
 
@@ -401,7 +417,11 @@ async def _run_stdio() -> None:
 def main() -> None:
     """Local stdio entrypoint: `python -m proofgate.mcp_server`."""
     _install_signal_handlers()
-    logger.info("Starting ProofGate MCP gateway (stdio transport, tools=%s)...", _PUBLIC_MCP_TOOLS)
+    logger.info(
+        "Starting ProofGate MCP gateway (stdio transport, tools=%s, runtime_mode=%s)...",
+        _PUBLIC_MCP_TOOLS,
+        mode_label(_RESOLVED_RUNTIME_MODE),
+    )
     try:
         anyio.run(_run_stdio)
     except KeyboardInterrupt:  # pragma: no cover - real process signal path
