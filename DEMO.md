@@ -561,3 +561,117 @@ Run the MCP-specific tests directly with:
 ```bash
 .venv/bin/pytest tests/test_mcp_server.py -q
 ```
+
+## Real agent loop against the real MCP gateway (Slice 21)
+
+`scripts/agent_loop.py` is a standalone, live-only experiment proving that
+an independent agent -- not a human- or test-authored call -- can discover
+ProofGate's real MCP tools, choose one, propose its business arguments,
+and have the real guarded pipeline evaluate the resulting request.
+
+> The model chooses a discovered MCP tool and proposes only its business
+> arguments. The trusted client supplies the original instruction, a
+> unique workflow ID, and no rollback proof before submitting the request
+> through the real MCP gateway.
+
+The model does **not** control ProofGate metadata: it never sees or sets
+`workflow_id`, `rollback_proof`, `requesting_user`, `agent_id`, or any
+policy/verdict/audit field. Its entire contribution is a `tool_name` plus
+`inactive_days`/`environment` -- both `AgentToolProposal` and
+`ProposedMutationArguments` (in `agent/agent_proposal.py`) use
+`extra="forbid"`, so any attempt to smuggle other fields in is rejected
+before anything is trusted.
+
+### Startup
+
+```bash
+source .venv/bin/activate
+PROOFGATE_RUNTIME_MODE=live python scripts/agent_loop.py --runs 5
+```
+
+Requires `PROOFGATE_RUNTIME_MODE=live` and a real, configured
+`NEBIUS_API_KEY` (`NEBIUS_LIVE_ENABLED` not explicitly disabled). If either
+is missing, the script exits immediately (before any proposal generation
+or MCP call) with a concise message -- it never silently substitutes
+deterministic fallback and calls the result "live."
+
+### What happens each run
+
+1. Reset `operations/working.db`, the workflow-budget state (via a fresh,
+   never-reused `agent-loop-<run>-<uuid>` workflow ID), and the enforcement
+   audit log; verify the deterministic `10,623`-row total.
+2. Ask the real Nebius-hosted model to choose one tool from the **real,
+   live-discovered** MCP tool list (`session.list_tools()` -- never a
+   hardcoded duplicate) and propose that tool's `inactive_days`/
+   `environment`. At most one provider request; any timeout, error,
+   malformed output, undiscovered tool name, or invalid argument becomes
+   `PROPOSAL_FAILURE` -- never guessed, never repaired, never submitted.
+3. For a valid proposal, the script -- never the model -- constructs the
+   final request: the unchanged original instruction, the fresh
+   `workflow_id`, the proposal's `inactive_days`/`environment` copied
+   through unchanged, and `rollback_proof: null`.
+4. Submits it through the real MCP stdio transport (the same
+   `mcp.client.stdio.stdio_client` + `mcp.ClientSession` path proven in
+   Slice 19's protocol-integrity test) and records the real structured
+   ProofGate response.
+
+### First-attempt proof semantics
+
+Every submitted request has `rollback_proof: null`. A correctly-scoped
+`delete_users` proposal (`environment="test"`) is therefore still expected
+to `BLOCK` on `RULE_RECOVERY_PROOF` alone -- that is a correctly-scoped
+irreversible proposal lacking required recovery proof, **not** a
+missing-scope mistake, and the transcript/report distinguish the two
+explicitly (`recovery_proof_only_block` vs `missing_filter_mistake`). A
+correctly-scoped `deactivate_users` proposal may reach `ALLOW`, since
+deactivation is reversible -- this is retained and reported honestly, not
+hidden.
+
+### Retained outcomes and aggregate metrics
+
+Both safe and unsafe proposals are retained; the script never cherry-picks
+runs. After all runs it reports the complete distribution: proposal
+status, tool selection, scope classification, `BLOCK`/`ALLOW` counts,
+per-rule trigger counts, execution counts, `missing_filter_mistake_count`,
+`recovery_proof_only_block_count`, `combined_scope_and_proof_block_count`,
+and `production_rows_mutated_total` (required to be exactly `0` across
+every run; the script stops and reports prominently, without
+characterizing the experiment as successful, if this is ever violated).
+
+### Transcript artifact
+
+One sanitized JSON transcript per experiment, written to
+`artifacts/agent_loop_<timestamp>.json` (the existing gitignored artifact
+directory -- never committed automatically). Contains the discovered
+tools, every run's validated proposal, the trusted metadata the script
+added, the real MCP result, per-run classification, and aggregate
+metrics. Never contains API keys, tokens, raw provider objects,
+authorization headers, or `.env` contents.
+
+### Offline test behavior
+
+`tests/test_agent_proposal.py` and `tests/test_agent_loop_script.py`
+exercise every importable helper (proposal validation, trusted-request
+construction, run classification, aggregate metrics, transcript assembly,
+CLI gating) using fake/mocked providers and subprocess-level gating checks
+only -- pytest never calls the real Nebius API or spawns a real live MCP
+experiment.
+
+### Known limitations
+
+- No repair/retry loop exists in this slice -- a `PROPOSAL_FAILURE` run is
+  recorded and skipped, never retried automatically.
+- Real model nondeterminism and provider latency/rate-limit behavior are
+  not characterized beyond a small local sample.
+- Explicit live CRAFT (Slice 20.1) is unrelated to and untouched by this
+  experiment; the agent-loop script never calls CRAFT.
+- `Streamlit` (`app.py`/`app_logic.py`) and reliable-demo behavior are
+  completely unchanged by this slice.
+
+### Reset behavior
+
+Every run resets the database, the (fresh, per-run) workflow budget, and
+the audit log before it starts. After the full experiment, the script
+resets the database and audit log again, leaving the repository in clean
+deterministic runtime state regardless of how many runs were requested or
+how they were classified.
