@@ -15,5 +15,8 @@ dev = [
     "pytest",
 ]
 
+[tool.setuptools.packages.find]
+include = ["agent*", "craft*", "operations*", "proofgate*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -1,4 +1,5 @@
 .venv/
+*.egg-info/
 operations/working.db
 operations/snapshots/
 operations/feature_flags_working.json
