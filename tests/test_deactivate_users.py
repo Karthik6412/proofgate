@@ -284,6 +284,30 @@ def test_broad_deactivate_users_triggers_exactly_two_rules_because_it_is_reversi
     assert count_rows(WORKING_DB_PATH) == 10623
 
 
+def test_broad_deactivate_users_suggested_repair_names_deactivate_users_not_delete_users():
+    """Slice 24 regression guard: build_suggested_repairs must name the
+    real tool being repaired. Before this fix, every suggestion
+    hardcoded "tool": "delete_users", which would have misattributed
+    this deactivate_users repair suggestion to the wrong tool."""
+    workflow_id = _fresh_workflow_id()
+    _fresh_clean_state(workflow_id)
+
+    result = guarded_execute(
+        tool_name="deactivate_users",
+        action_context=_action_context(workflow_id, DEACTIVATE_INSTRUCTION),
+        arguments={"inactive_days": 90, "environment": None},
+        rollback_proof=None,
+    )
+
+    assert result.suggested_repairs == [
+        {
+            "tool": "deactivate_users",
+            "arguments": {"inactive_days": 90, "environment": "test"},
+            "next_step": "create_snapshot",
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Corrected generic execution
 # ---------------------------------------------------------------------------
@@ -417,12 +441,13 @@ def test_registry_module_still_defines_no_second_canonicalization_function():
 
 
 def test_no_policy_special_casing_for_tool_name():
-    """proofgate/policy.py must contain no tool-identity branch at all --
-    not even a new deactivate_users one. The pre-existing, unconditional
-    "tool": "delete_users" literal inside build_suggested_repairs is a
-    static value in a suggested-repair dict (out of scope for this slice,
-    unrelated to any of the four rule checks), not a branch on tool_name,
-    so it is intentionally not asserted against here.
+    """proofgate/policy.py must contain no tool-identity branch at all.
+
+    build_suggested_repairs (Slice 24) accepts the real tool identity as
+    a plain parameter and places it directly into the returned
+    suggestion -- it is never compared or branched on, so this test's
+    "no tool-identity literal comparison" invariant still holds even
+    though build_suggested_repairs' output now correctly varies by tool.
     """
     source = Path(policy_module.__file__).read_text()
     assert "tool_name" not in source

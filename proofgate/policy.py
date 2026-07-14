@@ -147,13 +147,18 @@ def build_missing_requirements(
 def build_suggested_repairs(
     intent: IntentConstraints,
     inactive_days: int,
+    tool: str,
 ) -> list[dict]:
+    """tool is the real tool identity the caller already evaluated -- it
+    is only ever placed directly into the returned suggestion, never
+    compared or branched on, so this remains free of any special casing
+    for a particular tool identity."""
     if intent.environment is None:
         return []
 
     return [
         {
-            "tool": "delete_users",
+            "tool": tool,
             "arguments": {
                 "inactive_days": intent.inactivity_days or inactive_days,
                 "environment": intent.environment,

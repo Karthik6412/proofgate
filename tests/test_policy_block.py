@@ -110,6 +110,48 @@ def test_suggested_repairs_contains_corrected_call_and_next_step():
     } in result.suggested_repairs
 
 
+# ---------------------------------------------------------------------------
+# Slice 24: build_suggested_repairs names the real tool being repaired
+# ---------------------------------------------------------------------------
+
+
+def test_build_suggested_repairs_names_delete_users():
+    from proofgate.policy import build_suggested_repairs
+
+    intent = IntentConstraints(
+        action_type="delete", target_resource="users", environment="test", inactivity_days=90, confidence=1.0
+    )
+    repairs = build_suggested_repairs(intent=intent, inactive_days=90, tool="delete_users")
+    assert repairs == [
+        {"tool": "delete_users", "arguments": {"inactive_days": 90, "environment": "test"}, "next_step": "create_snapshot"}
+    ]
+
+
+def test_build_suggested_repairs_names_deactivate_users():
+    from proofgate.policy import build_suggested_repairs
+
+    intent = IntentConstraints(
+        action_type="deactivate", target_resource="users", environment="test", inactivity_days=90, confidence=1.0
+    )
+    repairs = build_suggested_repairs(intent=intent, inactive_days=90, tool="deactivate_users")
+    assert repairs == [
+        {
+            "tool": "deactivate_users",
+            "arguments": {"inactive_days": 90, "environment": "test"},
+            "next_step": "create_snapshot",
+        }
+    ]
+
+
+def test_build_suggested_repairs_empty_when_intent_environment_is_none():
+    from proofgate.policy import build_suggested_repairs
+
+    intent = IntentConstraints(
+        action_type="delete", target_resource="users", environment=None, inactivity_days=90, confidence=1.0
+    )
+    assert build_suggested_repairs(intent=intent, inactive_days=90, tool="delete_users") == []
+
+
 def test_missing_requirements_contains_expected_three():
     result = _run_broad()
     assert "environment=test" in result.missing_requirements

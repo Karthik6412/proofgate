@@ -149,7 +149,7 @@ def guarded_execute(
         workflow_budget=workflow_budget,
     )
     suggested_repairs = build_suggested_repairs(
-        intent=intent, inactive_days=arguments.get("inactive_days")
+        intent=intent, inactive_days=arguments.get("inactive_days"), tool=tool_name
     )
 
     mutation_result = None
@@ -266,9 +266,10 @@ def _guarded_execute_unknown_tool(
 
     No Operations preview, no risk extraction, no mutation, no snapshot,
     no workflow-budget consumption. suggested_repairs is deliberately
-    always [] here: the existing build_suggested_repairs helper hardcodes
-    "tool": "delete_users", which would misattribute a repair suggestion
-    to the wrong tool for a genuinely unknown tool_name.
+    always [] here (Slice 24): a genuinely unregistered tool_name has no
+    known preview/mutation function, snapshot support, or resource
+    binding to retry against -- there is nothing safe to suggest, no
+    matter what tool name would label it.
     """
     intent_outcome = extract_intent_live_or_fallback(action_context.original_instruction)
     intent = intent_outcome.value
