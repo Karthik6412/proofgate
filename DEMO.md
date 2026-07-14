@@ -1028,22 +1028,60 @@ table.
 > Feature-flag impact is calculated by deterministic code from registered
 > audience data. No language model determines the affected-user count.
 
-### Impact rounding
+### Impact rounding: effective-exposure accounting (corrected in Slice 25.1)
 
-For an environment actually targeted by the request, if the requested
-`(enabled, rollout_percentage)` differs from that environment's current
-recorded state, `affected = audience * rollout_percentage // 100`
-(integer floor) -- otherwise the environment is an untouched no-op with
-zero impact. A request already matching the current state everywhere it
-targets is a genuine zero-impact no-op, not an error.
+> Feature-flag blast radius is the number of users whose effective feature
+> exposure changes, not simply the audience implied by the requested
+> rollout percentage.
 
-**Documented limitation:** this simplified rule does not diff a shrinking
-rollout against previously-exposed users -- a request that disables a
-flag (`rollout_percentage=0`) is honestly counted as affecting 0 users by
-this formula, even though it is still recognized as a real configuration
-change (its version still increments). A real feature-flag provider's
-actual exposed-audience change on a rollout decrease is a materially
-harder problem, intentionally out of scope for this slice.
+Slice 25's original formula (`affected = audience * requested_rollout //
+100` whenever the request differed from current state) worked for
+enabling a flag from off, but was wrong for disabling one: a request
+that fully disabled a flag previously at 100% rollout reported `0`
+affected users, when the true answer is that all previously-exposed
+users lose access. Slice 25.1 corrected this by comparing *effective
+exposure* before and after the request, for each targeted environment:
+
+```python
+current_effective_percentage = current_rollout_percentage if current_enabled else 0
+requested_effective_percentage = requested_rollout_percentage if requested_enabled else 0
+current_exposed_users = audience * current_effective_percentage // 100
+requested_exposed_users = audience * requested_effective_percentage // 100
+affected_users = abs(requested_exposed_users - current_exposed_users)
+```
+
+(Integer floor rounding throughout, exactly as before.)
+
+> Preview and execution use the same deterministic environment-change
+> plan, so enabling, disabling, increasing rollout, and decreasing
+> rollout are accounted for symmetrically.
+
+Both `preview_set_feature_flag` and `set_feature_flag` derive their
+numbers from one shared `EnvironmentChangePlan` (`operations/
+feature_flags.py::_plan_environment_change`) -- neither computes impact
+independently, so they can never disagree.
+
+**Configuration changed is a different question from user exposure
+changed.** A request whose stored `rollout_percentage` differs from the
+current value while the flag is disabled both before and after (e.g.
+disabled at a stored 80% moving to disabled at 0%) still updates the
+authoritative file and increments version, but honestly reports `0`
+affected users -- no user's *effective* exposure changed. An exact
+no-op (requested state byte-identical to current state) performs no
+file write at all, not merely a write that reproduces identical bytes.
+
+Worked examples (92-user test audience):
+
+| Transition | Affected |
+|---|---|
+| disabled 0% → enabled 100% | 92 |
+| enabled 100% → disabled 0% | 92 |
+| enabled 100% → enabled 50% | 46 |
+| enabled 50% → enabled 100% | 46 |
+| disabled 0% → enabled 33% | 30 |
+| enabled 33% → disabled 0% | 30 |
+| disabled @80% → disabled @0% (config changes, exposure doesn't) | 0 |
+| enabled 100% → enabled 100% (exact no-op) | 0 |
 
 ### Selector hashing
 
@@ -1091,6 +1129,27 @@ An explicit, correctly-scoped production request (`environment=production`,
 `rollout_percentage=100`) still triggers `RULE_WORKFLOW_BUDGET` alone
 (9,981 exceeds the 100-row budget) -- explicit, correctly-represented
 intent never overrides workflow-budget protection.
+
+### Corrected disable, from enabled 100% (Slice 25.1)
+
+```text
+Setup: new_checkout.test = {enabled: true, rollout_percentage: 100}
+Instruction: "Disable the new checkout flow for the test environment."
+Arguments: flag_name=new_checkout, enabled=false, environment=test, rollout_percentage=0
+
+Verdict: ALLOW
+Impact: 92 (production=0, test=92)
+Mutation: affected=92, production_affected=0, test_affected=92
+Postcondition: VERIFIED
+Workflow budget: 92/100
+new_checkout.test: {enabled: false, rollout_percentage: 0, version: incremented}
+new_checkout.production: unchanged
+```
+
+This is the scenario Slice 25's original formula got wrong (it would
+have reported `0` affected users for this exact disable). Reducing an
+existing 100% test rollout to 50% correctly reports `46` affected users;
+increasing 50% back to 100% also correctly reports `46`.
 
 ### Recovery-proof reasoning
 
@@ -1174,9 +1233,12 @@ python scripts/feature_flag_demo.py
 ```
 
 Local and deterministic: forces the MCP subprocess's own runtime mode to
-`fallback` so no live Nebius call is attempted. Submits the broad and
-corrected requests above through the real MCP stdio gateway, independently
-verifies the resulting working-state file, confirms production and
-pristine state invariants, writes a sanitized transcript to
+`fallback` so no live Nebius call is attempted. Submits, in order, through
+the real MCP stdio gateway: the broad enable, the corrected enable, the
+corrected disable (from enabled 100%), a rollout reduction (100% → 50%),
+and an exact no-op (independently verified to perform zero file writes).
+Independently verifies the resulting working-state file after each
+allowed action, confirms production and pristine state invariants,
+writes a sanitized transcript to
 `artifacts/feature_flag_demo_<timestamp>.json` (gitignored), and resets
 feature-flag state, the users database, and the audit log afterward.

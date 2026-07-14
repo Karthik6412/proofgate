@@ -13,31 +13,37 @@ derived by querying the users table -- so this resource's impact can be
 computed without any cross-resource coupling. No language model is
 involved in computing impact.
 
-_plan_environment_change is the one shared predicate preview_set_feature_
-flag (read) and set_feature_flag (write) both use, mirroring
+_plan_environment_change is the one shared calculation preview_set_
+feature_flag (read) and set_feature_flag (write) both use, mirroring
 operations.selection.build_predicate's "one shared selection semantics"
 discipline exactly -- so read and write paths can never diverge on what
 counts as an affected/changed environment.
 
-Deterministic rounding rule (documented and tested): for an environment
-actually targeted by the request, if the requested (enabled,
-rollout_percentage) differs from that environment's current recorded
-state, affected = audience * rollout_percentage // 100 (integer floor);
-otherwise the environment is an untouched no-op with zero impact.
+Effective-exposure rule (Slice 25.1, documented and tested): blast
+radius is the number of users whose effective feature exposure changes,
+not simply the audience implied by the requested rollout percentage.
+For each targeted environment:
 
-Documented limitation: this simplified rule does not attempt to diff a
-shrinking rollout against previously-exposed users -- a request that
-disables a flag (rollout_percentage=0) is honestly counted as
-affecting 0 users by this formula, even though it is still recognized
-and recorded as a real configuration change (its version still
-increments). A real feature-flag provider's actual exposed-audience
-change on a rollout decrease is a materially harder problem intentionally
-out of scope for this slice.
+    current_effective_percentage = current_rollout_percentage if current_enabled else 0
+    requested_effective_percentage = requested_rollout_percentage if requested_enabled else 0
+    current_exposed_users = audience * current_effective_percentage // 100
+    requested_exposed_users = audience * requested_effective_percentage // 100
+    affected_users = abs(requested_exposed_users - current_exposed_users)
+
+This makes enabling and disabling symmetric, and rollout increases and
+decreases both count only the real exposure delta (deterministic integer
+floor rounding throughout). Stored configuration (enabled/rollout_
+percentage/version) can still change even when effective exposure does
+not -- e.g. disabled at a stored 80% moving to disabled at 0% -- because
+configuration changed is a different question from user exposure
+changed; the version still increments in that case, but affected_users
+is honestly reported as 0.
 """
 
 import datetime
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from proofgate.models import ImpactEnvelope, MutationResult
@@ -123,17 +129,50 @@ def _target_environments(environment: str | None) -> tuple[str, ...]:
     return (environment,) if environment is not None else ENVIRONMENTS
 
 
+@dataclass(frozen=True)
+class EnvironmentChangePlan:
+    """The one shared plan preview and mutation both derive their
+    numbers from -- neither ever computes affected/changed independently."""
+
+    environment: str
+    configuration_changed: bool
+    current_effective_percentage: int
+    requested_effective_percentage: int
+    current_exposed_users: int
+    requested_exposed_users: int
+    affected_users: int
+
+
 def _plan_environment_change(
-    current: dict, enabled: bool, rollout_percentage: int, audience: int
-) -> tuple[bool, int]:
-    """The one shared rule preview and mutation both use. Returns
-    (changed, affected) for a single environment. changed is true only
-    when the requested (enabled, rollout_percentage) differs from the
-    current recorded state for this environment; affected is the
-    deterministic floor-rounded count, zero for an untouched no-op."""
-    changed = (current["enabled"], current["rollout_percentage"]) != (enabled, rollout_percentage)
-    affected = (audience * rollout_percentage // 100) if changed else 0
-    return changed, affected
+    environment: str, current: dict, enabled: bool, rollout_percentage: int, audience: int
+) -> EnvironmentChangePlan:
+    """Effective-exposure planning for one environment (Slice 25.1).
+
+    configuration_changed reflects whether the stored (enabled,
+    rollout_percentage) fields would actually change -- this can be true
+    even when affected_users is 0 (e.g. disabled at a stored 80% moving
+    to disabled at 0%: configuration changed, but no user's effective
+    exposure did). affected_users is always the absolute exposure delta,
+    never a raw function of the requested rollout percentage alone.
+    """
+    current_effective_percentage = current["rollout_percentage"] if current["enabled"] else 0
+    requested_effective_percentage = rollout_percentage if enabled else 0
+
+    current_exposed_users = audience * current_effective_percentage // 100
+    requested_exposed_users = audience * requested_effective_percentage // 100
+    affected_users = abs(requested_exposed_users - current_exposed_users)
+
+    configuration_changed = (current["enabled"], current["rollout_percentage"]) != (enabled, rollout_percentage)
+
+    return EnvironmentChangePlan(
+        environment=environment,
+        configuration_changed=configuration_changed,
+        current_effective_percentage=current_effective_percentage,
+        requested_effective_percentage=requested_effective_percentage,
+        current_exposed_users=current_exposed_users,
+        requested_exposed_users=requested_exposed_users,
+        affected_users=affected_users,
+    )
 
 
 def preview_set_feature_flag(
@@ -155,8 +194,8 @@ def preview_set_feature_flag(
 
     environment_counts = {"test": 0, "production": 0}
     for env in _target_environments(environment):
-        _, affected = _plan_environment_change(flag_state[env], enabled, rollout_percentage, audience[env])
-        environment_counts[env] = affected
+        plan = _plan_environment_change(env, flag_state[env], enabled, rollout_percentage, audience[env])
+        environment_counts[env] = plan.affected_users
 
     estimated_count = sum(environment_counts.values())
     selector_hash = compute_selector_hash(
@@ -201,18 +240,24 @@ def set_feature_flag(
 
     production_affected = 0
     test_affected = 0
+    any_configuration_changed = False
     for env in _target_environments(environment):
-        changed, affected = _plan_environment_change(flag_state[env], enabled, rollout_percentage, audience[env])
-        if changed:
+        plan = _plan_environment_change(env, flag_state[env], enabled, rollout_percentage, audience[env])
+        if plan.configuration_changed:
             flag_state[env]["enabled"] = enabled
             flag_state[env]["rollout_percentage"] = rollout_percentage
             flag_state[env]["version"] += 1
+            any_configuration_changed = True
         if env == "production":
-            production_affected = affected
+            production_affected = plan.affected_users
         else:
-            test_affected = affected
+            test_affected = plan.affected_users
 
-    _atomic_write_json(working_path, state)
+    # An exact no-op (every targeted environment's stored configuration
+    # already matches the request) performs no write at all -- not merely
+    # a write that happens to reproduce identical bytes.
+    if any_configuration_changed:
+        _atomic_write_json(working_path, state)
 
     return MutationResult(
         affected_count=production_affected + test_affected,
