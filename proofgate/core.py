@@ -149,7 +149,7 @@ def guarded_execute(
         workflow_budget=workflow_budget,
     )
     suggested_repairs = build_suggested_repairs(
-        intent=intent, inactive_days=arguments.get("inactive_days"), tool=tool_name
+        intent=intent, selector_arguments=selector_arguments, tool=tool_name, hard_delete=spec.hard_delete
     )
 
     mutation_result = None

@@ -150,7 +150,7 @@ _configure_logging()
 # future slice does not silently expose it through MCP without review.
 # ---------------------------------------------------------------------------
 
-_PUBLIC_MCP_TOOLS: tuple[str, ...] = ("delete_users", "deactivate_users")
+_PUBLIC_MCP_TOOLS: tuple[str, ...] = ("delete_users", "deactivate_users", "set_feature_flag")
 
 _TOOL_DESCRIPTIONS: dict[str, str] = {
     "delete_users": (
@@ -163,6 +163,13 @@ _TOOL_DESCRIPTIONS: dict[str, str] = {
         "Guarded reversible deactivation of inactive user accounts, routed "
         "through the same deterministic policy engine as delete_users. "
         "Reversible: no rollback proof is required or checked."
+    ),
+    "set_feature_flag": (
+        "Guarded atomic feature-flag configuration update, routed through "
+        "the same deterministic policy engine as the two users-table tools. "
+        "Operates on a genuinely different, filesystem-backed resource "
+        "(feature-flag configuration, not the users database). Reversible: "
+        "no rollback proof is required or checked."
     ),
 }
 
@@ -265,6 +272,50 @@ class GuardedToolRequest(BaseModel):
     agent_id: str = Field(default="mcp-gateway", min_length=1)
 
 
+class FeatureFlagToolRequest(BaseModel):
+    """Slice 25: set_feature_flag's own input shape -- a genuinely
+    different selector (flag_name/enabled/rollout_percentage) from the
+    two users-table tools, so it cannot share GuardedToolRequest (which
+    is preserved byte-for-byte unchanged above, still used only by
+    delete_users/deactivate_users). Same governance fields
+    (instruction/workflow_id/rollback_proof/requesting_user/agent_id),
+    same extra="forbid" sole-validation-layer discipline, and reuses the
+    same environment normalization logic (_NormalizedEnvironment) rather
+    than duplicating it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instruction: _TrimmedText
+    workflow_id: _TrimmedText
+    flag_name: str = Field(min_length=1)
+    enabled: bool
+    environment: _NormalizedEnvironment = None
+    rollout_percentage: int = Field(ge=0, le=100)
+    rollback_proof: RollbackProofInput | None = None
+    requesting_user: str = Field(default="mcp-client", min_length=1)
+    agent_id: str = Field(default="mcp-gateway", min_length=1)
+
+
+# Registry-dispatch lookup (not tool-name special-casing, per the same
+# principle proofgate/registry.py already establishes): which request
+# model validates which public tool's input.
+_MCP_REQUEST_MODELS: dict[str, type[BaseModel]] = {
+    "delete_users": GuardedToolRequest,
+    "deactivate_users": GuardedToolRequest,
+    "set_feature_flag": FeatureFlagToolRequest,
+}
+
+# Fields every request model shares for trusted governance context --
+# never business/selector arguments. Used only to generically separate
+# "arguments guarded_execute should receive" from "arguments this
+# request model also happens to carry" -- a structural distinction, not
+# a per-tool branch.
+_GOVERNANCE_FIELDS = frozenset(
+    {"instruction", "workflow_id", "rollback_proof", "requesting_user", "agent_id"}
+)
+
+
 # ---------------------------------------------------------------------------
 # Graceful shutdown (Part M). The raw signal handler only sets a flag and
 # logs one line -- no filesystem/database work happens inside it.
@@ -298,9 +349,12 @@ server: Server = Server("proofgate-mcp-gateway")
 
 
 def _tool_definitions() -> list[types.Tool]:
-    schema = GuardedToolRequest.model_json_schema()
     return [
-        types.Tool(name=name, description=_TOOL_DESCRIPTIONS[name], inputSchema=schema)
+        types.Tool(
+            name=name,
+            description=_TOOL_DESCRIPTIONS[name],
+            inputSchema=_MCP_REQUEST_MODELS[name].model_json_schema(),
+        )
         for name in _PUBLIC_MCP_TOOLS
     ]
 
@@ -358,13 +412,19 @@ def _serialize_result(tool_name: str, result) -> dict[str, Any]:
     return payload
 
 
-def _invoke_guarded_tool(tool_name: str, request: GuardedToolRequest) -> dict[str, Any]:
+def _invoke_guarded_tool(tool_name: str, request: BaseModel) -> dict[str, Any]:
     """The entire adapter: build the existing ActionContext/RollbackProof,
     call the existing shared guarded_execute(...) boundary once, and
     serialize its result. No preview, intent, policy, proof, selector,
     budget, mutation, postcondition, or audit logic lives here -- all of
     it is the same shared pipeline every other caller (Streamlit, direct
     Python, prior slices' tests) already goes through unchanged.
+
+    request may be a GuardedToolRequest or a FeatureFlagToolRequest (or
+    any future model in _MCP_REQUEST_MODELS) -- the business/selector
+    arguments guarded_execute receives are derived generically by
+    excluding the shared governance fields, never by branching on
+    tool_name or on the request's concrete type.
     """
     action_context = ActionContext(
         workflow_id=request.workflow_id,
@@ -375,18 +435,17 @@ def _invoke_guarded_tool(tool_name: str, request: GuardedToolRequest) -> dict[st
     rollback_proof = (
         RollbackProof(**request.rollback_proof.model_dump()) if request.rollback_proof else None
     )
-    result = guarded_execute(
-        tool_name,
-        action_context,
-        {"inactive_days": request.inactive_days, "environment": request.environment},
-        rollback_proof,
-    )
+    arguments = {
+        key: value for key, value in request.model_dump().items() if key not in _GOVERNANCE_FIELDS
+    }
+    result = guarded_execute(tool_name, action_context, arguments, rollback_proof)
     return _serialize_result(tool_name, result)
 
 
 @server.call_tool(validate_input=False)
 async def _call_tool(name: str, arguments: dict) -> dict[str, Any]:
-    if name not in _PUBLIC_MCP_TOOLS:
+    request_model = _MCP_REQUEST_MODELS.get(name)
+    if request_model is None:
         raise ValueError(
             f"Unknown tool {name!r}. This gateway exposes only {_PUBLIC_MCP_TOOLS}."
         )
@@ -398,7 +457,7 @@ async def _call_tool(name: str, arguments: dict) -> dict[str, Any]:
         )
 
     try:
-        request = GuardedToolRequest.model_validate(arguments)
+        request = request_model.model_validate(arguments)
     except ValidationError as exc:
         raise ValueError(f"Invalid arguments for {name}: {exc}") from exc
 

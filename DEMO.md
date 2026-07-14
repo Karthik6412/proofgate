@@ -987,3 +987,196 @@ deterministic policy engine, proof-validation semantics, canonical
 selector hashing, and the tool registry are all completely unchanged.
 Rollback is not, and does not add, an agent-facing MCP tool -- it is
 reachable only through the existing guarded post-execution pipeline.
+
+## A non-user-management consequential tool: set_feature_flag (Slice 25)
+
+> `set_feature_flag` demonstrates that ProofGate's guarded boundary is not
+> tied to SQL deletion or user-management selectors. The same
+> deterministic policy, impact, budget, postcondition, audit, repair, and
+> MCP pipeline governs a filesystem-backed configuration mutation.
+
+### Why this tool, and why not outbound notifications
+
+A third tool was added specifically to prove genericity across a
+*resource*, not just across reversibility (Slice 18 already proved that
+across two tools on the same `users` table). Simulated outbound
+notification delivery was considered and rejected for this slice: it is
+inherently irreversible in a way that would force redefining recovery
+proof as audience approval rather than recoverability, adding a new proof
+type, adding a human-approval concept, or permanently blocking the
+corrected case -- any of which would broaden this slice into a
+proof-model redesign rather than a genericity proof. `set_feature_flag`
+stays reversible under the *existing* proof semantics, so it tests
+architectural genericity in isolation.
+
+### How the resource differs from `users`
+
+|                | `delete_users` / `deactivate_users` | `set_feature_flag` |
+|----------------|--------------------------------------|---------------------|
+| Backend        | `operations/working.db` (SQLite)     | `operations/feature_flags_working.json` (local JSON) |
+| Selector shape | `inactive_days`, `environment`       | `flag_name`, `enabled`, `environment`, `rollout_percentage` |
+| Mutation       | row deletion / status update         | atomic configuration replacement |
+| Reversibility  | irreversible / reversible            | reversible |
+
+`operations/feature_flags.py` never imports `operations.database` or
+`operations.actions`, and never touches the users table -- confirmed by
+a dedicated AST-based test. Audience counts (`operations/
+feature_flag_audience.json`: `test=92`, `production=9981`, `total=10073`)
+are fixed, deterministic local data, never derived by querying the users
+table.
+
+> Feature-flag impact is calculated by deterministic code from registered
+> audience data. No language model determines the affected-user count.
+
+### Impact rounding
+
+For an environment actually targeted by the request, if the requested
+`(enabled, rollout_percentage)` differs from that environment's current
+recorded state, `affected = audience * rollout_percentage // 100`
+(integer floor) -- otherwise the environment is an untouched no-op with
+zero impact. A request already matching the current state everywhere it
+targets is a genuine zero-impact no-op, not an error.
+
+**Documented limitation:** this simplified rule does not diff a shrinking
+rollout against previously-exposed users -- a request that disables a
+flag (`rollout_percentage=0`) is honestly counted as affecting 0 users by
+this formula, even though it is still recognized as a real configuration
+change (its version still increments). A real feature-flag provider's
+actual exposed-audience change on a rollout decrease is a materially
+harder problem, intentionally out of scope for this slice.
+
+### Selector hashing
+
+`set_feature_flag` reuses the exact same `proofgate.selector.
+compute_selector_hash` function and canonicalization as the two
+users-table tools -- no second hash implementation, no feature-flag
+special case in the hash logic itself. Making this work required widening
+`SELECTOR_FIELDS` (a plain data allowlist of every registered tool's own
+selector-argument names) to also include `flag_name`, `enabled`, and
+`rollout_percentage` alongside the existing `inactive_days`/`environment`
+-- the canonicalization algorithm, key ordering, and serialization are
+byte-for-byte unchanged, and `delete_users`/`deactivate_users` selector
+hashes are unaffected (their arguments never contain the new keys).
+
+### Broad request and exact outcome
+
+```text
+Instruction: "Enable the new checkout flow for test users."
+Arguments: flag_name=new_checkout, enabled=true, environment=null, rollout_percentage=100
+
+Verdict: BLOCK
+Impact: 10,073 total (9,981 production, 92 test)
+Triggered rules: RULE_INTENT_BOUNDARY, RULE_WORKFLOW_BUDGET
+(RULE_RECOVERY_PROOF never fires -- see below)
+Executed: false
+Working feature-flag state: unchanged
+```
+
+### Corrected request and exact outcome
+
+```text
+Instruction: "Enable the new checkout flow for the test environment."
+Arguments: flag_name=new_checkout, enabled=true, environment=test, rollout_percentage=100
+
+Verdict: ALLOW
+Mutation: affected=92, production_affected=0, test_affected=92
+Postcondition: VERIFIED
+Workflow budget: 92/100
+new_checkout.test: {enabled: true, rollout_percentage: 100, version: 2}
+new_checkout.production: unchanged (enabled: false, rollout_percentage: 0, version: 1)
+Pristine feature-flag state: unchanged
+```
+
+An explicit, correctly-scoped production request (`environment=production`,
+`rollout_percentage=100`) still triggers `RULE_WORKFLOW_BUDGET` alone
+(9,981 exceeds the 100-row budget) -- explicit, correctly-represented
+intent never overrides workflow-budget protection.
+
+### Recovery-proof reasoning
+
+> Recovery proof is not required because this sandbox models the
+> configuration update as reversible. Real provider propagation and
+> downstream user effects may have different recovery characteristics and
+> remain outside this local demonstration.
+
+`set_feature_flag` is registered with `hard_delete=False`,
+`reversibility="reversible"` -- the exact same registry metadata shape
+`deactivate_users` already uses. `RULE_RECOVERY_PROOF` reads only
+`ImpactEnvelope.hard_delete` (never a tool-name branch), so it never fires
+for this tool; no snapshot is ever created or validated for it, and it
+never enters Slice 23's automatic rollback (rollback's own eligibility
+check requires `hard_delete=True`). Raw `proof_status` follows the
+existing reversible-action contract (`"MISSING"`, meaning "none supplied,
+none required" -- the same honest wire-format value `deactivate_users`
+already produces, disambiguated the same way in any human-facing
+presentation layer, per Slice 24).
+
+### Workflow budget and postcondition
+
+Unchanged, generic machinery: affected users count toward the same
+workflow budget as any other tool (`92/100` for the corrected request; a
+genuine no-op consumes `0`). Postcondition verification is the same
+unmodified `verify_postcondition` comparing the deterministic preview's
+predicted count against the mutation's own honestly-reported actual
+count -- no feature-flag-specific verification logic exists.
+
+### Repair guidance
+
+A blocked broad rollout's suggested repair now names `set_feature_flag`
+(never `delete_users`/`deactivate_users`), preserves `flag_name`,
+`enabled`, and `rollout_percentage` unchanged, and corrects only
+`environment` to `"test"`. Its `next_step` reads
+`"retry_with_corrected_environment"`, never `"create_snapshot"` --
+suggesting a snapshot for a reversible action would be actively
+misleading. This generalization (Slice 25) also corrected
+`deactivate_users`' own repair suggestion the same way, for the same
+reason.
+
+### MCP discovery and schemas
+
+Tool discovery now returns exactly three tools: `deactivate_users`,
+`delete_users`, `set_feature_flag`. `delete_users`/`deactivate_users`
+still share the exact same `GuardedToolRequest` schema, byte-for-byte
+unchanged. `set_feature_flag` has its own new `FeatureFlagToolRequest`
+schema (`flag_name`, `enabled`, `environment`, `rollout_percentage`, plus
+the same governance fields), selected via a registry-dispatch lookup
+keyed by tool name -- never an `if tool_name == "set_feature_flag":`
+branch anywhere in the guarded pipeline itself. The MCP handler never
+imports `operations.feature_flags` directly; every governed call still
+routes through the one shared `guarded_execute(...)` boundary.
+
+### Reset
+
+```python
+from operations.feature_flags import reset_feature_flags_working
+reset_feature_flags_working()
+```
+
+Restores `operations/feature_flags_working.json` to the exact pristine
+seed. Affects only feature-flag state -- never the users database, never
+the pristine file itself. Safe to call repeatedly.
+
+### No Streamlit exposure, no real provider
+
+This slice is a backend and MCP genericity proof only: `app.py` and
+`app_logic.py` are completely unchanged, and no feature-flag selector,
+button, or page was added anywhere in Streamlit. No real feature-flag
+provider (LaunchDarkly, Unleash, ConfigCat, AWS AppConfig, or otherwise)
+is contacted, and no network call is made anywhere in this tool's path.
+Existing `delete_users`/`deactivate_users`/rollback behavior is completely
+unaffected.
+
+### Demonstration
+
+```bash
+source .venv/bin/activate
+python scripts/feature_flag_demo.py
+```
+
+Local and deterministic: forces the MCP subprocess's own runtime mode to
+`fallback` so no live Nebius call is attempted. Submits the broad and
+corrected requests above through the real MCP stdio gateway, independently
+verifies the resulting working-state file, confirms production and
+pristine state invariants, writes a sanitized transcript to
+`artifacts/feature_flag_demo_<timestamp>.json` (gitignored), and resets
+feature-flag state, the users database, and the audit log afterward.

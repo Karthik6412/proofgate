@@ -146,23 +146,43 @@ def build_missing_requirements(
 
 def build_suggested_repairs(
     intent: IntentConstraints,
-    inactive_days: int,
+    selector_arguments: dict,
     tool: str,
+    hard_delete: bool,
 ) -> list[dict]:
     """tool is the real tool identity the caller already evaluated -- it
     is only ever placed directly into the returned suggestion, never
     compared or branched on, so this remains free of any special casing
-    for a particular tool identity."""
+    for a particular tool identity.
+
+    selector_arguments is the same generic selector dict the caller
+    already built from this tool's own registered selector_argument_
+    names (proofgate.core.guarded_execute's own selector_arguments) --
+    every submitted argument is preserved unchanged except environment,
+    which is corrected to the intent's own resolved value. This is what
+    lets a tool with a completely different argument shape (e.g.
+    flag_name/enabled/rollout_percentage) receive an honest, correctly
+    shaped repair suggestion without this function needing to know
+    anything tool-specific.
+
+    hard_delete is the same generic registry metadata already available
+    to the caller (never a tool-name check): a hard-delete action's real
+    next step is creating a recovery snapshot before retrying; a
+    reversible action never needs one, and suggesting one would be
+    actively misleading.
+    """
     if intent.environment is None:
         return []
+
+    corrected_arguments = dict(selector_arguments)
+    corrected_arguments["environment"] = intent.environment
+    if "inactive_days" in corrected_arguments and intent.inactivity_days is not None:
+        corrected_arguments["inactive_days"] = intent.inactivity_days
 
     return [
         {
             "tool": tool,
-            "arguments": {
-                "inactive_days": intent.inactivity_days or inactive_days,
-                "environment": intent.environment,
-            },
-            "next_step": "create_snapshot",
+            "arguments": corrected_arguments,
+            "next_step": "create_snapshot" if hard_delete else "retry_with_corrected_environment",
         }
     ]

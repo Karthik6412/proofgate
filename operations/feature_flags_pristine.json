@@ -1,0 +1,14 @@
+{
+  "new_checkout": {
+    "test": {
+      "enabled": false,
+      "rollout_percentage": 0,
+      "version": 1
+    },
+    "production": {
+      "enabled": false,
+      "rollout_percentage": 0,
+      "version": 1
+    }
+  }
+}

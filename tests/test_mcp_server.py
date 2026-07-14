@@ -85,10 +85,10 @@ def test_module_import_is_side_effect_free_beyond_registry_assertion():
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
-def test_exactly_the_two_intended_tools_are_registered():
+def test_exactly_the_three_intended_tools_are_registered():
     tools_result = _run(_list_tools_via_client())
     names = {t.name for t in tools_result.tools}
-    assert names == {"delete_users", "deactivate_users"}
+    assert names == {"delete_users", "deactivate_users", "set_feature_flag"}
 
 
 async def _list_tools_via_client():
@@ -693,7 +693,7 @@ def test_stdio_protocol_integrity_real_subprocess():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
-                assert {t.name for t in tools.tools} == {"delete_users", "deactivate_users"}
+                assert {t.name for t in tools.tools} == {"delete_users", "deactivate_users", "set_feature_flag"}
 
                 result = await session.call_tool(
                     "delete_users",

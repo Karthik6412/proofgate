@@ -76,8 +76,12 @@ def _find_audit_event(event_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def test_registry_contains_exactly_delete_users_and_deactivate_users():
-    assert set(_REGISTRY.keys()) == {"delete_users", "deactivate_users"}
+def test_registry_contains_delete_users_and_deactivate_users():
+    """Slice 25 adds a third registered tool (set_feature_flag, see
+    tests/test_feature_flag.py for its own registry assertions); this
+    test only confirms the two users-table tools from this slice remain
+    present and unaffected."""
+    assert {"delete_users", "deactivate_users"}.issubset(set(_REGISTRY.keys()))
 
 
 def test_registry_deactivate_users_metadata_is_correct():
@@ -286,9 +290,15 @@ def test_broad_deactivate_users_triggers_exactly_two_rules_because_it_is_reversi
 
 def test_broad_deactivate_users_suggested_repair_names_deactivate_users_not_delete_users():
     """Slice 24 regression guard: build_suggested_repairs must name the
-    real tool being repaired. Before this fix, every suggestion
+    real tool being repaired. Before that fix, every suggestion
     hardcoded "tool": "delete_users", which would have misattributed
-    this deactivate_users repair suggestion to the wrong tool."""
+    this deactivate_users repair suggestion to the wrong tool.
+
+    Slice 25 additionally generalized next_step to depend on the
+    generic hard_delete registry metadata rather than always saying
+    "create_snapshot" -- deactivate_users is reversible and never needs
+    one, so suggesting it here would be actively misleading (the same
+    reasoning Slice 25's set_feature_flag repair guidance requires)."""
     workflow_id = _fresh_workflow_id()
     _fresh_clean_state(workflow_id)
 
@@ -303,7 +313,7 @@ def test_broad_deactivate_users_suggested_repair_names_deactivate_users_not_dele
         {
             "tool": "deactivate_users",
             "arguments": {"inactive_days": 90, "environment": "test"},
-            "next_step": "create_snapshot",
+            "next_step": "retry_with_corrected_environment",
         }
     ]
 

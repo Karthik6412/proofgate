@@ -111,7 +111,8 @@ def test_suggested_repairs_contains_corrected_call_and_next_step():
 
 
 # ---------------------------------------------------------------------------
-# Slice 24: build_suggested_repairs names the real tool being repaired
+# Slice 24/25: build_suggested_repairs names the real tool being repaired
+# and preserves whatever selector arguments that tool actually used.
 # ---------------------------------------------------------------------------
 
 
@@ -121,7 +122,12 @@ def test_build_suggested_repairs_names_delete_users():
     intent = IntentConstraints(
         action_type="delete", target_resource="users", environment="test", inactivity_days=90, confidence=1.0
     )
-    repairs = build_suggested_repairs(intent=intent, inactive_days=90, tool="delete_users")
+    repairs = build_suggested_repairs(
+        intent=intent,
+        selector_arguments={"inactive_days": 90, "environment": None},
+        tool="delete_users",
+        hard_delete=True,
+    )
     assert repairs == [
         {"tool": "delete_users", "arguments": {"inactive_days": 90, "environment": "test"}, "next_step": "create_snapshot"}
     ]
@@ -133,12 +139,17 @@ def test_build_suggested_repairs_names_deactivate_users():
     intent = IntentConstraints(
         action_type="deactivate", target_resource="users", environment="test", inactivity_days=90, confidence=1.0
     )
-    repairs = build_suggested_repairs(intent=intent, inactive_days=90, tool="deactivate_users")
+    repairs = build_suggested_repairs(
+        intent=intent,
+        selector_arguments={"inactive_days": 90, "environment": None},
+        tool="deactivate_users",
+        hard_delete=False,
+    )
     assert repairs == [
         {
             "tool": "deactivate_users",
             "arguments": {"inactive_days": 90, "environment": "test"},
-            "next_step": "create_snapshot",
+            "next_step": "retry_with_corrected_environment",
         }
     ]
 
@@ -149,7 +160,43 @@ def test_build_suggested_repairs_empty_when_intent_environment_is_none():
     intent = IntentConstraints(
         action_type="delete", target_resource="users", environment=None, inactivity_days=90, confidence=1.0
     )
-    assert build_suggested_repairs(intent=intent, inactive_days=90, tool="delete_users") == []
+    assert (
+        build_suggested_repairs(
+            intent=intent, selector_arguments={"inactive_days": 90, "environment": None}, tool="delete_users", hard_delete=True
+        )
+        == []
+    )
+
+
+def test_build_suggested_repairs_preserves_non_environment_selector_arguments_generically():
+    """The generalization Slice 25 needed: a tool with a completely
+    different selector shape (flag_name/enabled/rollout_percentage) must
+    get an honestly-shaped repair suggestion, with only environment
+    corrected -- proving this function performs no tool-specific
+    argument-shape assumptions."""
+    from proofgate.policy import build_suggested_repairs
+
+    intent = IntentConstraints(
+        action_type="unknown", target_resource="unknown", environment="test", inactivity_days=None, confidence=0.4
+    )
+    repairs = build_suggested_repairs(
+        intent=intent,
+        selector_arguments={"flag_name": "new_checkout", "enabled": True, "environment": None, "rollout_percentage": 100},
+        tool="set_feature_flag",
+        hard_delete=False,
+    )
+    assert repairs == [
+        {
+            "tool": "set_feature_flag",
+            "arguments": {
+                "flag_name": "new_checkout",
+                "enabled": True,
+                "environment": "test",
+                "rollout_percentage": 100,
+            },
+            "next_step": "retry_with_corrected_environment",
+        }
+    ]
 
 
 def test_missing_requirements_contains_expected_three():

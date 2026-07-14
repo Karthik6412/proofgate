@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import operations.actions as operations_actions
+import operations.feature_flags as operations_feature_flags
 from proofgate.models import ImpactEnvelope, MutationResult
 
 
@@ -60,6 +61,22 @@ def _deactivate_users_mutation(**kwargs) -> MutationResult:
     return operations_actions.deactivate_users(**kwargs)
 
 
+def _set_feature_flag_preview(**kwargs) -> ImpactEnvelope:
+    """Call-time module-attribute lookup, same pattern as
+    _delete_users_preview, so operations.feature_flags.
+    preview_set_feature_flag stays patchable in tests. A genuinely
+    different resource (filesystem-backed feature-flag JSON, not the
+    users database) reached through the exact same registry-dispatch
+    mechanism as the two users-table tools."""
+    return operations_feature_flags.preview_set_feature_flag(**kwargs)
+
+
+def _set_feature_flag_mutation(**kwargs) -> MutationResult:
+    """Call-time module-attribute lookup, same pattern as
+    _delete_users_mutation, for operations.feature_flags.set_feature_flag."""
+    return operations_feature_flags.set_feature_flag(**kwargs)
+
+
 _REGISTRY: dict[str, GuardedToolSpec] = {
     "delete_users": GuardedToolSpec(
         tool_name="delete_users",
@@ -76,6 +93,15 @@ _REGISTRY: dict[str, GuardedToolSpec] = {
         mutation_fn=_deactivate_users_mutation,
         selector_argument_names=("inactive_days", "environment"),
         resource="users",
+        hard_delete=False,
+        reversibility="reversible",
+    ),
+    "set_feature_flag": GuardedToolSpec(
+        tool_name="set_feature_flag",
+        preview_fn=_set_feature_flag_preview,
+        mutation_fn=_set_feature_flag_mutation,
+        selector_argument_names=("flag_name", "enabled", "environment", "rollout_percentage"),
+        resource="feature_flags",
         hard_delete=False,
         reversibility="reversible",
     ),
