@@ -256,6 +256,6 @@ commit or were checkpointed together.
 
 ## Built by
 
-Karthik Nair & Disha, at the Enterprise Agents Hackathon by Emergence AI,
+Karthik Nair & Disha Anil, at the Enterprise Agents Hackathon by Emergence AI,
 in partnership with Nebius. Hardened afterward into a portfolio-quality
 reference implementation.
