@@ -1,9 +1,10 @@
-# ProofGate
+# ProofGate — Portfolio Reference Implementation
 
-ProofGate is a deterministic runtime enforcement layer between AI agents
-and consequential tools. It previews blast radius, applies
-machine-verifiable policy, requires recovery evidence where appropriate,
-and records what actually happened before and after execution.
+ProofGate is an open-source portfolio reference implementation of a
+deterministic runtime enforcement layer between AI agents and consequential
+tools. It previews blast radius, applies machine-verifiable policy, requires
+recovery evidence where appropriate, and records what actually happened
+before and after execution.
 
 ## The failure this exists to stop
 
@@ -208,7 +209,7 @@ want to exercise live Nebius or live CRAFT. Neither is required:
 execution -- it is not an enforcement verdict. Reproduce this table with
 `python scripts/run_portfolio_demo.py`.
 
-As of the final verification run for this slice: **835 deterministic
+As of the latest verification run: **863 deterministic
 tests pass**, offline, with zero external calls. See `DEMO.md` for the
 exact click paths and per-slice detail.
 
