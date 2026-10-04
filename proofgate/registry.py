@@ -108,6 +108,27 @@ _REGISTRY: dict[str, GuardedToolSpec] = {
 }
 
 
+def register_tool(spec: GuardedToolSpec) -> None:
+    """Add spec to the registry under spec.tool_name.
+
+    Re-registering an equal spec is a no-op. Equality is the frozen
+    dataclass's field-by-field comparison, so preview_fn/mutation_fn
+    compare by object identity: registering module-level functions again
+    is idempotent, while a different callable or different metadata under
+    an already-registered name raises ValueError and leaves the existing
+    spec in place -- a registration is never silently replaced or dropped.
+    """
+    existing = _REGISTRY.get(spec.tool_name)
+    if existing is None:
+        _REGISTRY[spec.tool_name] = spec
+        return
+    if existing != spec:
+        raise ValueError(
+            f"Tool {spec.tool_name!r} is already registered with a different "
+            "spec; refusing to replace it."
+        )
+
+
 def get_tool_spec(tool_name: str) -> GuardedToolSpec | None:
     """Look up a registered tool, or None if it isn't registered.
 
