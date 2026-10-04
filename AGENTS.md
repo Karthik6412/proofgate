@@ -2,7 +2,14 @@
 
 ## Mission
 
-Build the hackathon MVP described in `docs/ProofGate_PRD_FINAL_v4.md`.
+> **Scope note.** This file was written for the original Operations MVP.
+> For ProofGate Action Boundary work, `docs/action-boundary-final-build-spec.md`
+> is the source of truth and wins on conflict. The Build Order, "do not broaden
+> beyond the PRD", and Time Discipline exclusions below apply only to the original
+> MVP. Permanent architectural, safety, and test invariants, and existing
+> Operations behavior, remain in force and must not regress.
+
+Build the hackathon MVP described in `ProofGate_PRD_FINAL_v4.md`.
 
 ProofGate measures the blast radius of consequential AI-agent actions before execution.
 

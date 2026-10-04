@@ -1,6 +1,6 @@
 ---
 name: proofgate-build-slice
-description: Use this skill whenever implementing a single vertical slice of ProofGate (any item from the Build Order in AGENTS.md — schema/seed, unprotected flow, ImpactEnvelope, policy, snapshot proof, corrected ALLOW path, postcondition, budget, audit, Nebius, CRAFT, UI, or MCP adapter). Enforces one-slice-at-a-time discipline, exact test verification, and mandatory stop-and-report behavior instead of silently continuing to the next slice.
+description: Use this skill whenever implementing a single vertical slice of ProofGate (any item from the Build Order in AGENTS.md — schema/seed, unprotected flow, ImpactEnvelope, policy, snapshot proof, corrected ALLOW path, postcondition, budget, audit, Nebius, CRAFT, UI, or MCP adapter — or any ProofGate Action Boundary slice from docs/action-boundary-final-build-spec.md). Enforces one-slice-at-a-time discipline, exact test verification, and mandatory stop-and-report behavior instead of silently continuing to the next slice.
 ---
 
 # ProofGate Build Slice
@@ -10,6 +10,18 @@ description: Use this skill whenever implementing a single vertical slice of Pro
 Any time you are about to write or modify code for ProofGate. This applies to every
 item in AGENTS.md's Build Order — there is no such thing as a ProofGate code change
 that falls outside this workflow.
+
+## Scope: original MVP vs Action Boundary
+
+- Original MVP work: the PRD and AGENTS.md Build Order define the slices.
+- ProofGate Action Boundary work: `docs/action-boundary-final-build-spec.md` defines
+  the slice sequence and is authoritative. Do not reject an Action Boundary change
+  because it falls outside the original 14-slice Build Order. Wherever this skill
+  says "PRD" or "Build Order", read the Action Boundary spec instead.
+- All quality gates, test discipline, safety invariants, and existing Operations
+  behavior still apply unless the Action Boundary spec explicitly supersedes them.
+- Core policy stays binary ALLOW/BLOCK in v1. REQUIRE_APPROVAL is a later thin layer
+  above a successful core ALLOW; do not make `PolicyDecision` three-state.
 
 ## Before starting a slice
 
