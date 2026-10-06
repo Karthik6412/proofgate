@@ -64,7 +64,13 @@ flowchart TB
 - Calculates impact (`operations/actions.py`, `operations/feature_flags.py`).
 - Validates proof (`proofgate/proofs.py`).
 - Checks workflow budget (`proofgate/budgets.py`).
-- Evaluates policy (`proofgate/policy.py`) -- the sole ALLOW/BLOCK authority.
+- Evaluates policy -- the sole ALLOW/BLOCK authority. `guarded_execute`
+  calls the tool's `spec.policy_fn`; for Operations that is the adapter in
+  `proofgate/bindings/operations.py`, which builds an
+  `OperationsPolicyContext` and runs the generic
+  `evaluate_policy(context, OPERATIONS_RULESET)` engine in
+  `proofgate/policy.py`, returning a `PolicyDecision`. Unknown impact fails
+  closed with `RULE_UNKNOWN_IMPACT` before any context is built.
 - Executes Operations mutations, only after a genuine ALLOW.
 - Verifies postconditions (`proofgate/postcondition.py`).
 - Decides rollback eligibility and resolves the final postcondition status
@@ -98,6 +104,7 @@ sequenceDiagram
     participant Registry
     participant Semantic as Semantic Extraction
     participant Impact as Impact Preview
+    participant Adapter as Operations Policy Adapter
     participant Policy as Deterministic Policy
     participant Audit
 
@@ -106,8 +113,10 @@ sequenceDiagram
     MCP->>Semantic: extract intent (live-preferred, deterministic fallback)
     MCP->>Impact: preview_delete_users(...)
     Impact-->>MCP: ImpactEnvelope (10,073 / 9,981 production / 92 test)
-    MCP->>Policy: evaluate_policy(intent, impact, proof, budget)
-    Policy-->>MCP: BLOCK, {RULE_INTENT_BOUNDARY, RULE_RECOVERY_PROOF, RULE_WORKFLOW_BUDGET}
+    MCP->>Adapter: spec.policy_fn(intent, impact, risk, proof validity, budget)
+    Adapter->>Policy: evaluate_policy(OperationsPolicyContext, OPERATIONS_RULESET)
+    Policy-->>Adapter: PolicyDecision
+    Adapter-->>MCP: BLOCK, [RULE_INTENT_BOUNDARY, RULE_RECOVERY_PROOF, RULE_WORKFLOW_BUDGET]
     Note over MCP: Operations is never called on BLOCK
     MCP->>Audit: append one AuditEvent
     MCP-->>Client: verdict=BLOCK, executed=false
@@ -121,6 +130,7 @@ sequenceDiagram
     participant MCP as MCP Gateway
     participant Impact as Impact Preview
     participant ProofBudget as Proof / Budget Checks
+    participant Adapter as Operations Policy Adapter
     participant Policy as Deterministic Policy
     participant Ops as Operations
     participant Post as Postcondition
@@ -131,8 +141,10 @@ sequenceDiagram
     Impact-->>MCP: ImpactEnvelope (92 test / 0 production)
     MCP->>ProofBudget: validate_rollback_proof(...), check budget
     ProofBudget-->>MCP: proof VALID, budget OK
-    MCP->>Policy: evaluate_policy(...)
-    Policy-->>MCP: ALLOW, no triggered rules
+    MCP->>Adapter: spec.policy_fn(...)
+    Adapter->>Policy: evaluate_policy(OperationsPolicyContext, OPERATIONS_RULESET)
+    Policy-->>Adapter: PolicyDecision
+    Adapter-->>MCP: ALLOW, no triggered rules
     MCP->>Ops: delete_users(inactive_days=90, environment="test")
     Ops-->>MCP: MutationResult(affected=92, production=0, test=92)
     MCP->>Post: verify_postcondition(impact, mutation_result)

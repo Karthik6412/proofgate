@@ -8,7 +8,9 @@ Operations, proofgate/bindings/operations.py) adds its tools through
 register_tool, and each runtime entrypoint calls that binding explicitly.
 
 The registry only describes a tool; it never evaluates policy, risk, or
-proof, and it never decides ALLOW/BLOCK. selector_argument_names is
+proof, and it never decides ALLOW/BLOCK. policy_fn is the domain's policy
+callable (returning a proofgate.policy.PolicyDecision) that
+proofgate.core invokes; the registry only stores it. selector_argument_names is
 descriptive metadata used by proofgate.core to extract a selector dict
 from the generic arguments dict -- the actual selector canonicalization
 and hashing still flows entirely through the single shared implementation
@@ -17,7 +19,7 @@ which already use it), never duplicated here.
 """
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from proofgate.models import ImpactEnvelope, MutationResult
 
@@ -31,6 +33,9 @@ class GuardedToolSpec:
     resource: str
     hard_delete: bool
     reversibility: str
+    # Returns proofgate.policy.PolicyDecision. Typed loosely so this module
+    # keeps depending only on proofgate.models.
+    policy_fn: Callable[..., Any]
 
 
 _REGISTRY: dict[str, GuardedToolSpec] = {}

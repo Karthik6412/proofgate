@@ -1,17 +1,149 @@
 """Trusted Operations binding: registers the Operations tools into the
-generic proofgate.registry.
+generic proofgate.registry and owns what Operations policy means.
 
 operations/ is the domain; this module is the adapter between it and the
 generic ProofGate machinery. The registry never imports this module --
 each runtime entrypoint (tests/conftest.py, proofgate/mcp_server.py,
 app.py) calls register_operations_tools() explicitly. Importing this
 module registers nothing by itself.
+
+Operations policy is OperationsPolicyContext plus OPERATIONS_RULESET,
+evaluated by the generic proofgate.policy.evaluate_policy. Every spec
+carries the same module-level evaluate_operations_policy as its
+policy_fn, so proofgate.core reaches these rules without importing this
+module.
 """
+
+from dataclasses import dataclass
 
 import operations.actions as operations_actions
 import operations.feature_flags as operations_feature_flags
-from proofgate.models import ImpactEnvelope, MutationResult
+from proofgate.models import (
+    ImpactEnvelope,
+    IntentConstraints,
+    MutationResult,
+    RiskFeatures,
+    WorkflowBudget,
+)
+from proofgate.policy import (
+    RULE_INTENT_BOUNDARY,
+    RULE_RECOVERY_PROOF,
+    RULE_WORKFLOW_BUDGET,
+    PolicyDecision,
+    RuleOutcome,
+    RuleSet,
+    evaluate_policy,
+)
 from proofgate.registry import GuardedToolSpec, register_tool
+
+MAX_MUTATED_ROWS_PER_WORKFLOW = 100
+
+
+@dataclass(frozen=True)
+class OperationsPolicyContext:
+    """Everything the Operations rules read. Only ever built from a known
+    ImpactEnvelope; unknown impact fails closed before a context exists."""
+
+    intent: IntentConstraints
+    impact: ImpactEnvelope
+    risk: RiskFeatures | None
+    rollback_proof_valid: bool
+    workflow_budget: WorkflowBudget
+
+    @property
+    def production_impact(self) -> bool:
+        return self.impact.environment_counts.get("production", 0) > 0
+
+
+@dataclass(frozen=True)
+class IntentBoundaryRule:
+    rule_id: str = RULE_INTENT_BOUNDARY
+
+    def evaluate(self, context: OperationsPolicyContext, /) -> RuleOutcome:
+        if context.intent.environment == "test" and context.production_impact:
+            return RuleOutcome.failed(
+                self.rule_id,
+                "The user requested test scope, but production rows are included.",
+                f"environment={context.intent.environment}",
+            )
+        return RuleOutcome.passed(self.rule_id)
+
+
+@dataclass(frozen=True)
+class RecoveryProofRule:
+    rule_id: str = RULE_RECOVERY_PROOF
+
+    def evaluate(self, context: OperationsPolicyContext, /) -> RuleOutcome:
+        if context.impact.hard_delete and not context.rollback_proof_valid:
+            return RuleOutcome.failed(
+                self.rule_id,
+                "The irreversible action has no valid rollback proof.",
+                "valid rollback proof",
+            )
+        return RuleOutcome.passed(self.rule_id)
+
+
+@dataclass(frozen=True)
+class WorkflowBudgetRule:
+    """Operations budget unit: affected rows across the workflow."""
+
+    rule_id: str = RULE_WORKFLOW_BUDGET
+
+    def evaluate(self, context: OperationsPolicyContext, /) -> RuleOutcome:
+        projected = context.workflow_budget.rows_mutated + context.impact.estimated_count
+        if projected > MAX_MUTATED_ROWS_PER_WORKFLOW:
+            return RuleOutcome.failed(
+                self.rule_id,
+                (
+                    f"{context.impact.estimated_count} projected mutations exceed the "
+                    f"{MAX_MUTATED_ROWS_PER_WORKFLOW}-row workflow budget."
+                ),
+                f"workflow impact within {MAX_MUTATED_ROWS_PER_WORKFLOW} rows",
+            )
+        return RuleOutcome.passed(self.rule_id)
+
+
+def operations_risk_factors(context: OperationsPolicyContext) -> list[str]:
+    """Explanatory only; never affects the verdict."""
+    risk_factors: list[str] = []
+    if context.risk is not None:
+        risk_factors.append(f"{context.risk.scope_class} scope")
+        if context.production_impact:
+            risk_factors.append("production impact")
+        if context.risk.intent_mismatch:
+            risk_factors.append("intent mismatch")
+        if context.risk.irreversible:
+            risk_factors.append("irreversible action")
+        if context.impact.hard_delete and not context.rollback_proof_valid:
+            risk_factors.append("missing proof")
+    return risk_factors
+
+
+OPERATIONS_RULESET: RuleSet[OperationsPolicyContext] = RuleSet(
+    rules=(IntentBoundaryRule(), RecoveryProofRule(), WorkflowBudgetRule()),
+    risk_factors_fn=operations_risk_factors,
+)
+
+
+def evaluate_operations_policy(
+    *,
+    intent: IntentConstraints,
+    impact: ImpactEnvelope,
+    risk: RiskFeatures | None,
+    rollback_proof_valid: bool,
+    workflow_budget: WorkflowBudget,
+) -> PolicyDecision:
+    """The policy_fn every Operations spec carries: builds the Operations
+    context from guarded_execute's runtime facts and evaluates
+    OPERATIONS_RULESET with the generic engine."""
+    context = OperationsPolicyContext(
+        intent=intent,
+        impact=impact,
+        risk=risk,
+        rollback_proof_valid=rollback_proof_valid,
+        workflow_budget=workflow_budget,
+    )
+    return evaluate_policy(context, OPERATIONS_RULESET)
 
 
 def _delete_users_preview(**kwargs) -> ImpactEnvelope:
@@ -67,6 +199,7 @@ OPERATIONS_TOOL_SPECS: tuple[GuardedToolSpec, ...] = (
         resource="users",
         hard_delete=True,
         reversibility="irreversible_without_snapshot",
+        policy_fn=evaluate_operations_policy,
     ),
     GuardedToolSpec(
         tool_name="deactivate_users",
@@ -76,6 +209,7 @@ OPERATIONS_TOOL_SPECS: tuple[GuardedToolSpec, ...] = (
         resource="users",
         hard_delete=False,
         reversibility="reversible",
+        policy_fn=evaluate_operations_policy,
     ),
     GuardedToolSpec(
         tool_name="set_feature_flag",
@@ -85,6 +219,7 @@ OPERATIONS_TOOL_SPECS: tuple[GuardedToolSpec, ...] = (
         resource="feature_flags",
         hard_delete=False,
         reversibility="reversible",
+        policy_fn=evaluate_operations_policy,
     ),
 )
 

@@ -1,19 +1,28 @@
 """Deterministic ProofGate policy engine.
 
-Nebius (agent.nebius_client) never returns a verdict. This module is the
-sole authority for ALLOW/BLOCK: any triggered rule blocks. Risk score is
-explanatory only and never overrides the triggered-rule verdict.
+Nebius (agent.nebius_client) never returns a verdict. The generic engine
+below (RuleOutcome, Rule, RuleSet, PolicyDecision, evaluate_policy,
+unknown_impact_decision) is the sole authority for ALLOW/BLOCK: a domain
+supplies its own context type and a RuleSet over it, the rules run in
+declared order, and any triggered rule blocks. The engine never knows a
+concrete context -- the Operations context and rules live in
+proofgate/bindings/operations.py, which this module never imports.
+
+compute_risk_score and build_suggested_repairs are not part of the
+generic engine. They are Operations-shaped helpers kept here for
+compatibility; both are explanatory only and never affect the verdict.
 """
+
+from dataclasses import dataclass
+from typing import Callable, Generic, Literal, Protocol, TypeVar
 
 from proofgate.models import (
     ImpactEnvelope,
     IntentConstraints,
     RiskFeatures,
     TriggeredRule,
-    WorkflowBudget,
 )
 
-MAX_MUTATED_ROWS_PER_WORKFLOW = 100
 POLICY_VERSION = "v1"
 
 RULE_INTENT_BOUNDARY = "RULE_INTENT_BOUNDARY"
@@ -21,72 +30,116 @@ RULE_RECOVERY_PROOF = "RULE_RECOVERY_PROOF"
 RULE_UNKNOWN_IMPACT = "RULE_UNKNOWN_IMPACT"
 RULE_WORKFLOW_BUDGET = "RULE_WORKFLOW_BUDGET"
 
+ContextT = TypeVar("ContextT")
+ContextT_contra = TypeVar("ContextT_contra", contravariant=True)
 
-def evaluate_policy(
-    intent: IntentConstraints,
-    proposed_arguments: dict,
-    impact: ImpactEnvelope | None,
-    risk: RiskFeatures | None,
-    rollback_proof_valid: bool,
-    workflow_budget: WorkflowBudget,
-) -> tuple[list[TriggeredRule], list[str]]:
-    """Returns (triggered_rules, risk_factors). Fails closed on unknown impact."""
-    if impact is None:
-        return (
-            [
-                TriggeredRule(
-                    rule_id=RULE_UNKNOWN_IMPACT,
-                    explanation="Impact preview failed or is unknown for a consequential action.",
-                )
-            ],
-            [],
+
+@dataclass(frozen=True)
+class RuleOutcome:
+    """The result of evaluating one rule once.
+
+    A triggered outcome carries everything derived from that single
+    evaluation -- its TriggeredRule and, when the domain defines one, the
+    requirement whose absence made it fire -- so triggered rules and
+    missing requirements can never come from separate conditions.
+    """
+
+    rule_id: str
+    triggered_rule: TriggeredRule | None = None
+    missing_requirement: str | None = None
+
+    @property
+    def triggered(self) -> bool:
+        return self.triggered_rule is not None
+
+    @classmethod
+    def passed(cls, rule_id: str) -> "RuleOutcome":
+        return cls(rule_id=rule_id)
+
+    @classmethod
+    def failed(
+        cls, rule_id: str, explanation: str, missing_requirement: str | None = None
+    ) -> "RuleOutcome":
+        return cls(
+            rule_id=rule_id,
+            triggered_rule=TriggeredRule(rule_id=rule_id, explanation=explanation),
+            missing_requirement=missing_requirement,
         )
 
-    triggered: list[TriggeredRule] = []
-    production_impact = impact.environment_counts.get("production", 0) > 0
-    intent_requires_test = intent.environment == "test"
 
-    if intent_requires_test and production_impact:
-        triggered.append(
-            TriggeredRule(
-                rule_id=RULE_INTENT_BOUNDARY,
-                explanation="The user requested test scope, but production rows are included.",
-            )
-        )
+class Rule(Protocol[ContextT_contra]):
+    rule_id: str
 
-    if impact.hard_delete and not rollback_proof_valid:
-        triggered.append(
-            TriggeredRule(
-                rule_id=RULE_RECOVERY_PROOF,
-                explanation="The irreversible action has no valid rollback proof.",
-            )
-        )
+    def evaluate(self, context: ContextT_contra, /) -> RuleOutcome: ...
 
-    projected = workflow_budget.rows_mutated + impact.estimated_count
-    if projected > MAX_MUTATED_ROWS_PER_WORKFLOW:
-        triggered.append(
-            TriggeredRule(
-                rule_id=RULE_WORKFLOW_BUDGET,
-                explanation=(
-                    f"{impact.estimated_count} projected mutations exceed the "
-                    f"{MAX_MUTATED_ROWS_PER_WORKFLOW}-row workflow budget."
-                ),
-            )
-        )
 
-    risk_factors: list[str] = []
-    if risk is not None:
-        risk_factors.append(f"{risk.scope_class} scope")
-        if production_impact:
-            risk_factors.append("production impact")
-        if risk.intent_mismatch:
-            risk_factors.append("intent mismatch")
-        if risk.irreversible:
-            risk_factors.append("irreversible action")
-        if impact.hard_delete and not rollback_proof_valid:
-            risk_factors.append("missing proof")
+def _no_risk_factors(context: object) -> list[str]:
+    return []
 
-    return triggered, risk_factors
+
+@dataclass(frozen=True)
+class RuleSet(Generic[ContextT]):
+    """An ordered set of rules over one domain context type.
+
+    risk_factors_fn supplies the domain's explanatory risk factors for
+    the same context. They are carried into the PolicyDecision for
+    display and audit only; they never affect the verdict.
+    """
+
+    rules: tuple[Rule[ContextT], ...]
+    risk_factors_fn: Callable[[ContextT], list[str]] = _no_risk_factors
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    """Every output is derived from the ordered outcomes, so the verdict,
+    triggered rules and missing requirements cannot disagree."""
+
+    outcomes: tuple[RuleOutcome, ...]
+    risk_factors: tuple[str, ...] = ()
+
+    @property
+    def triggered_rules(self) -> list[TriggeredRule]:
+        return [outcome.triggered_rule for outcome in self.outcomes if outcome.triggered_rule is not None]
+
+    @property
+    def missing_requirements(self) -> list[str]:
+        return [
+            outcome.missing_requirement
+            for outcome in self.outcomes
+            if outcome.triggered and outcome.missing_requirement is not None
+        ]
+
+    @property
+    def verdict(self) -> Literal["ALLOW", "BLOCK"]:
+        return "BLOCK" if any(outcome.triggered for outcome in self.outcomes) else "ALLOW"
+
+
+def evaluate_policy(context: ContextT, ruleset: RuleSet[ContextT]) -> PolicyDecision:
+    """Run every rule in declared order against an evaluable context.
+
+    Deterministic and side-effect free: no I/O, no model calls, no
+    mutation. The context must already be complete -- unknown impact is
+    decided before a context exists, via unknown_impact_decision.
+    """
+    outcomes = []
+    for rule in ruleset.rules:
+        outcome = rule.evaluate(context)
+        if outcome.rule_id != rule.rule_id:
+            raise ValueError(f"Rule {rule.rule_id!r} returned an outcome for {outcome.rule_id!r}.")
+        outcomes.append(outcome)
+    return PolicyDecision(
+        outcomes=tuple(outcomes),
+        risk_factors=tuple(ruleset.risk_factors_fn(context)),
+    )
+
+
+def unknown_impact_decision(explanation: str, missing_requirement: str) -> PolicyDecision:
+    """Fail closed when consequential impact is unknown: RULE_UNKNOWN_IMPACT
+    alone, no domain rule evaluated, no risk factors."""
+    return PolicyDecision(
+        outcomes=(RuleOutcome.failed(RULE_UNKNOWN_IMPACT, explanation, missing_requirement),),
+    )
 
 
 def compute_risk_score(
@@ -94,7 +147,7 @@ def compute_risk_score(
     risk: RiskFeatures,
     proof_required_and_missing: bool,
 ) -> float:
-    """Explanatory only; triggered rules in evaluate_policy decide the verdict."""
+    """Explanatory only; the triggered rules decide the verdict."""
     count = impact.estimated_count
     if count <= 10:
         score = 0.5
@@ -117,31 +170,6 @@ def compute_risk_score(
     score += risk.uncertainty
 
     return min(score, 10.0)
-
-
-def build_missing_requirements(
-    intent: IntentConstraints,
-    rollback_proof_valid: bool,
-    impact: ImpactEnvelope | None,
-    workflow_budget: WorkflowBudget,
-) -> list[str]:
-    if impact is None:
-        return ["known operational impact"]
-
-    missing: list[str] = []
-    production_impact = impact.environment_counts.get("production", 0) > 0
-
-    if intent.environment == "test" and production_impact:
-        missing.append(f"environment={intent.environment}")
-
-    if impact.hard_delete and not rollback_proof_valid:
-        missing.append("valid rollback proof")
-
-    projected = workflow_budget.rows_mutated + impact.estimated_count
-    if projected > MAX_MUTATED_ROWS_PER_WORKFLOW:
-        missing.append(f"workflow impact within {MAX_MUTATED_ROWS_PER_WORKFLOW} rows")
-
-    return missing
 
 
 def build_suggested_repairs(

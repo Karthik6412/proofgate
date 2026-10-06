@@ -12,8 +12,9 @@ from unittest import mock
 import pytest
 
 from agent.nebius_client import extract_intent, extract_risk_features
-from operations.actions import count_rows, delete_users
+from operations.actions import count_rows, delete_users, preview_delete_users
 from operations.database import PRISTINE_DB_PATH, WORKING_DB_PATH, reset_working_db
+from proofgate.bindings.operations import OPERATIONS_RULESET, OperationsPolicyContext
 from proofgate.core import guarded_delete_users
 from proofgate.models import ActionContext, ImpactEnvelope, IntentConstraints, WorkflowBudget
 from proofgate.policy import (
@@ -207,7 +208,7 @@ def test_missing_requirements_contains_expected_three():
 
 
 def test_workflow_budget_starts_at_0_of_100():
-    from proofgate.policy import MAX_MUTATED_ROWS_PER_WORKFLOW
+    from proofgate.bindings.operations import MAX_MUTATED_ROWS_PER_WORKFLOW
 
     budget = WorkflowBudget(workflow_id="wf-1")
     assert budget.rows_mutated == 0
@@ -248,17 +249,54 @@ def test_operations_delete_users_never_invoked_on_block():
 
 
 def test_unknown_impact_rule_triggers_when_preview_unavailable():
+    """Unknown impact fails closed before any Operations context exists:
+    RULE_UNKNOWN_IMPACT alone, and the Operations rules never run."""
+
+    def failing_preview(**kwargs):
+        raise RuntimeError("preview failed")
+
+    with mock.patch("operations.actions.preview_delete_users", failing_preview), mock.patch(
+        "proofgate.bindings.operations.OperationsPolicyContext"
+    ) as context_spy:
+        result = _run_broad()
+
+    assert [rule.rule_id for rule in result.triggered_rules] == [RULE_UNKNOWN_IMPACT]
+    assert result.missing_requirements == ["known operational impact"]
+    assert result.risk_factors == []
+    context_spy.assert_not_called()
+
+
+def test_operations_ruleset_evaluates_broad_context_in_rule_order():
+    """The Operations rules, evaluated through the generic engine over an
+    OperationsPolicyContext built from the real broad preview."""
     intent = extract_intent(BROAD_INSTRUCTION)
-    triggered, risk_factors = evaluate_policy(
+    impact = preview_delete_users(inactive_days=90, environment=None)
+    context = OperationsPolicyContext(
         intent=intent,
-        proposed_arguments={"inactive_days": 90, "environment": None},
-        impact=None,
-        risk=None,
+        impact=impact,
+        risk=extract_risk_features(intent, {"inactive_days": 90, "environment": None}, impact),
         rollback_proof_valid=False,
         workflow_budget=WorkflowBudget(workflow_id="wf-1"),
     )
-    triggered_ids = {rule.rule_id for rule in triggered}
-    assert triggered_ids == {RULE_UNKNOWN_IMPACT}
+
+    decision = evaluate_policy(context, OPERATIONS_RULESET)
+
+    assert decision.verdict == "BLOCK"
+    assert [outcome.rule_id for outcome in decision.outcomes] == [
+        RULE_INTENT_BOUNDARY,
+        RULE_RECOVERY_PROOF,
+        RULE_WORKFLOW_BUDGET,
+    ]
+    assert [rule.rule_id for rule in decision.triggered_rules] == [
+        RULE_INTENT_BOUNDARY,
+        RULE_RECOVERY_PROOF,
+        RULE_WORKFLOW_BUDGET,
+    ]
+    assert decision.missing_requirements == [
+        "environment=test",
+        "valid rollback proof",
+        "workflow impact within 100 rows",
+    ]
 
 
 def test_pristine_db_rejected_as_mutation_target():

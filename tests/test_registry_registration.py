@@ -39,6 +39,14 @@ def _other_mutation(**kwargs):
     raise AssertionError("never called by registration tests")
 
 
+def _policy(**kwargs):
+    raise AssertionError("never called by registration tests")
+
+
+def _other_policy(**kwargs):
+    raise AssertionError("never called by registration tests")
+
+
 def _fake_spec(**overrides) -> GuardedToolSpec:
     fields = dict(
         tool_name="fake_tool",
@@ -48,6 +56,7 @@ def _fake_spec(**overrides) -> GuardedToolSpec:
         resource="fake_resource",
         hard_delete=False,
         reversibility="reversible",
+        policy_fn=_policy,
     )
     fields.update(overrides)
     return GuardedToolSpec(**fields)
@@ -90,8 +99,9 @@ def test_reregistering_each_existing_operations_spec_is_a_noop(isolated_registry
         {"resource": "other_resource"},
         {"hard_delete": True},
         {"reversibility": "irreversible_without_snapshot"},
+        {"policy_fn": _other_policy},
     ],
-    ids=["mutation_fn", "preview_fn", "selectors", "resource", "hard_delete", "reversibility"],
+    ids=["mutation_fn", "preview_fn", "selectors", "resource", "hard_delete", "reversibility", "policy_fn"],
 )
 def test_conflicting_spec_raises_and_keeps_existing(isolated_registry, override):
     original = _fake_spec()
@@ -101,6 +111,20 @@ def test_conflicting_spec_raises_and_keeps_existing(isolated_registry, override)
         register_tool(_fake_spec(**override))
 
     assert get_tool_spec("fake_tool") is original
+
+
+def test_operations_specs_share_one_stable_policy_fn_across_registrations(isolated_registry):
+    from proofgate.bindings.operations import evaluate_operations_policy, register_operations_tools
+
+    before = {name: get_tool_spec(name) for name in EXPECTED_TOOLS}
+    register_operations_tools()
+    register_operations_tools()
+
+    for name in EXPECTED_TOOLS:
+        spec = get_tool_spec(name)
+        assert spec is before[name]
+        assert spec.policy_fn is evaluate_operations_policy
+    assert registered_tool_names() == EXPECTED_TOOLS
 
 
 def test_conflicting_spec_cannot_replace_an_operations_tool(isolated_registry):

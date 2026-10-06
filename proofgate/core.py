@@ -36,14 +36,12 @@ from proofgate.budgets import (
     record_execution,
     reset_workflow_state,
 )
-from proofgate.models import ActionContext, AuditEvent, EnforcementResult, RollbackProof, TriggeredRule
+from proofgate.models import ActionContext, AuditEvent, EnforcementResult, RollbackProof
 from proofgate.policy import (
     POLICY_VERSION,
-    RULE_UNKNOWN_IMPACT,
-    build_missing_requirements,
     build_suggested_repairs,
     compute_risk_score,
-    evaluate_policy,
+    unknown_impact_decision,
 )
 from proofgate.postcondition import verify_postcondition
 from proofgate.proofs import validate_rollback_proof
@@ -60,6 +58,9 @@ __all__ = [
     "get_workflow_budget",
     "reset_workflow_state",
 ]
+
+_UNKNOWN_IMPACT_REQUIREMENT = "known operational impact"
+_PREVIEW_FAILED_EXPLANATION = "Impact preview failed or is unknown for a consequential action."
 
 
 def guarded_execute(
@@ -122,16 +123,23 @@ def guarded_execute(
     workflow_budget = get_workflow_budget(action_context.workflow_id)
     budget_before = workflow_budget.model_copy()
 
-    triggered_rules, risk_factors = evaluate_policy(
-        intent=intent,
-        proposed_arguments=selector_arguments,
-        impact=impact,
-        risk=risk,
-        rollback_proof_valid=rollback_proof_valid,
-        workflow_budget=workflow_budget,
-    )
+    # Unknown impact fails closed here, before any domain context exists;
+    # the tool's policy_fn only ever sees a known ImpactEnvelope.
+    if impact is None:
+        decision = unknown_impact_decision(_PREVIEW_FAILED_EXPLANATION, _UNKNOWN_IMPACT_REQUIREMENT)
+    else:
+        decision = spec.policy_fn(
+            intent=intent,
+            impact=impact,
+            risk=risk,
+            rollback_proof_valid=rollback_proof_valid,
+            workflow_budget=workflow_budget,
+        )
 
-    verdict = "BLOCK" if triggered_rules else "ALLOW"
+    verdict = decision.verdict
+    triggered_rules = decision.triggered_rules
+    risk_factors = list(decision.risk_factors)
+    missing_requirements = decision.missing_requirements
 
     if impact is not None and risk is not None:
         risk_score = compute_risk_score(
@@ -142,12 +150,6 @@ def guarded_execute(
     else:
         risk_score = 10.0
 
-    missing_requirements = build_missing_requirements(
-        intent=intent,
-        rollback_proof_valid=rollback_proof_valid,
-        impact=impact,
-        workflow_budget=workflow_budget,
-    )
     suggested_repairs = build_suggested_repairs(
         intent=intent, selector_arguments=selector_arguments, tool=tool_name, hard_delete=spec.hard_delete
     )
@@ -277,16 +279,13 @@ def _guarded_execute_unknown_tool(
     workflow_budget = get_workflow_budget(action_context.workflow_id)
     budget_snapshot = workflow_budget.model_copy()
 
-    triggered_rules = [
-        TriggeredRule(
-            rule_id=RULE_UNKNOWN_IMPACT,
-            explanation=f"Tool {tool_name!r} is not registered; impact cannot be measured.",
-        )
-    ]
-    risk_score = 10.0
-    missing_requirements = build_missing_requirements(
-        intent=intent, rollback_proof_valid=False, impact=None, workflow_budget=workflow_budget
+    decision = unknown_impact_decision(
+        f"Tool {tool_name!r} is not registered; impact cannot be measured.",
+        _UNKNOWN_IMPACT_REQUIREMENT,
     )
+    triggered_rules = decision.triggered_rules
+    risk_score = 10.0
+    missing_requirements = decision.missing_requirements
 
     extraction_mode = "mixed" if intent_outcome.mode == "nebius_live" else "deterministic_fallback"
     craft_evidence = get_craft_evidence(action_context.workflow_id)
