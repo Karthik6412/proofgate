@@ -2,8 +2,10 @@
 
 Explicit and local by design: no plugin loading, no config-driven
 registration, no dynamic imports, no filesystem discovery, no policy DSL,
-no generic schema generation. Adding a tool means adding one more
-GuardedToolSpec entry to _REGISTRY below -- nothing else.
+no generic schema generation. This module is generic machinery only: it
+imports no domain package and starts empty. A domain binding (for
+Operations, proofgate/bindings/operations.py) adds its tools through
+register_tool, and each runtime entrypoint calls that binding explicitly.
 
 The registry only describes a tool; it never evaluates policy, risk, or
 proof, and it never decides ALLOW/BLOCK. selector_argument_names is
@@ -17,8 +19,6 @@ which already use it), never duplicated here.
 from dataclasses import dataclass
 from typing import Callable
 
-import operations.actions as operations_actions
-import operations.feature_flags as operations_feature_flags
 from proofgate.models import ImpactEnvelope, MutationResult
 
 
@@ -33,79 +33,7 @@ class GuardedToolSpec:
     reversibility: str
 
 
-def _delete_users_preview(**kwargs) -> ImpactEnvelope:
-    """Thin indirection that resolves operations.actions.preview_delete_users
-    by module-attribute lookup at call time (not a frozen reference bound
-    at registry-construction time), so tests can still patch
-    operations.actions.preview_delete_users directly -- the real, dumb
-    Operations function this ultimately calls."""
-    return operations_actions.preview_delete_users(**kwargs)
-
-
-def _delete_users_mutation(**kwargs) -> MutationResult:
-    """Same module-attribute indirection as _delete_users_preview, for
-    operations.actions.delete_users."""
-    return operations_actions.delete_users(**kwargs)
-
-
-def _deactivate_users_preview(**kwargs) -> ImpactEnvelope:
-    """Call-time module-attribute lookup, same pattern as
-    _delete_users_preview, so operations.actions.preview_deactivate_users
-    stays patchable in tests."""
-    return operations_actions.preview_deactivate_users(**kwargs)
-
-
-def _deactivate_users_mutation(**kwargs) -> MutationResult:
-    """Call-time module-attribute lookup, same pattern as
-    _delete_users_mutation, for operations.actions.deactivate_users."""
-    return operations_actions.deactivate_users(**kwargs)
-
-
-def _set_feature_flag_preview(**kwargs) -> ImpactEnvelope:
-    """Call-time module-attribute lookup, same pattern as
-    _delete_users_preview, so operations.feature_flags.
-    preview_set_feature_flag stays patchable in tests. A genuinely
-    different resource (filesystem-backed feature-flag JSON, not the
-    users database) reached through the exact same registry-dispatch
-    mechanism as the two users-table tools."""
-    return operations_feature_flags.preview_set_feature_flag(**kwargs)
-
-
-def _set_feature_flag_mutation(**kwargs) -> MutationResult:
-    """Call-time module-attribute lookup, same pattern as
-    _delete_users_mutation, for operations.feature_flags.set_feature_flag."""
-    return operations_feature_flags.set_feature_flag(**kwargs)
-
-
-_REGISTRY: dict[str, GuardedToolSpec] = {
-    "delete_users": GuardedToolSpec(
-        tool_name="delete_users",
-        preview_fn=_delete_users_preview,
-        mutation_fn=_delete_users_mutation,
-        selector_argument_names=("inactive_days", "environment"),
-        resource="users",
-        hard_delete=True,
-        reversibility="irreversible_without_snapshot",
-    ),
-    "deactivate_users": GuardedToolSpec(
-        tool_name="deactivate_users",
-        preview_fn=_deactivate_users_preview,
-        mutation_fn=_deactivate_users_mutation,
-        selector_argument_names=("inactive_days", "environment"),
-        resource="users",
-        hard_delete=False,
-        reversibility="reversible",
-    ),
-    "set_feature_flag": GuardedToolSpec(
-        tool_name="set_feature_flag",
-        preview_fn=_set_feature_flag_preview,
-        mutation_fn=_set_feature_flag_mutation,
-        selector_argument_names=("flag_name", "enabled", "environment", "rollout_percentage"),
-        resource="feature_flags",
-        hard_delete=False,
-        reversibility="reversible",
-    ),
-}
+_REGISTRY: dict[str, GuardedToolSpec] = {}
 
 
 def register_tool(spec: GuardedToolSpec) -> None:

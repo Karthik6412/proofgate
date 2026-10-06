@@ -380,6 +380,7 @@ source .venv/bin/activate
 .venv/bin/python -c "
 from operations.database import reset_working_db
 from operations.snapshots import create_snapshot
+from proofgate.bindings.operations import register_operations_tools; register_operations_tools()
 from proofgate.core import guarded_delete_users
 from proofgate.budgets import reset_workflow_state, get_workflow_budget
 from proofgate.audit import reset_audit_log

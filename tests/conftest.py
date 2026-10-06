@@ -31,6 +31,11 @@ their own body, exactly as they already do for the legacy flags.
 import pytest
 
 import proofgate.audit as audit_module
+from proofgate.bindings.operations import register_operations_tools
+
+# Module level, not a fixture: some test modules call get_tool_spec() at
+# import time (collection), before any fixture runs.
+register_operations_tools()
 
 
 @pytest.fixture(autouse=True)

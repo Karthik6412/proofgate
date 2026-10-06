@@ -52,9 +52,14 @@ from craft.evidence import prepare_craft_evidence
 from operations.database import WORKING_DB_PATH, reset_working_db
 from operations.snapshots import create_snapshot
 from proofgate.audit import DEFAULT_AUDIT_PATH
+from proofgate.bindings.operations import register_operations_tools
 from proofgate.core import guarded_delete_users, guarded_execute
 from proofgate.models import ActionContext
 from proofgate.runtime_mode import apply_runtime_mode_to_environment, mode_label
+
+# The registry starts empty; register the Operations tools this app calls.
+# Idempotent, so every Streamlit rerun of this script is safe.
+register_operations_tools()
 
 # Slice 20: resolve the centralized runtime mode once at startup and, only
 # for FALLBACK/RELIABLE_DEMO, force the legacy NEBIUS_LIVE_ENABLED /

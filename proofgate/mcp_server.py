@@ -117,6 +117,7 @@ from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 import proofgate.audit as audit_module
+from proofgate.bindings.operations import register_operations_tools
 from proofgate.core import guarded_execute
 from proofgate.models import ActionContext, RollbackProof
 from proofgate.registry import registered_tool_names
@@ -191,6 +192,9 @@ def _assert_registry_matches_public_surface() -> None:
         )
 
 
+# The registry starts empty; this gateway serves the Operations tools, so it
+# registers them explicitly before checking its public surface against them.
+register_operations_tools()
 _assert_registry_matches_public_surface()
 
 # Slice 20: resolve the centralized runtime mode once at import/startup and,

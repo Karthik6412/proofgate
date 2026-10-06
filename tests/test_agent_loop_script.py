@@ -975,12 +975,11 @@ def test_app_py_is_not_imported_by_agent_loop_or_agent_proposal():
         assert "from app_logic import" not in source
 
 
-def test_git_diff_confirms_app_py_and_app_logic_unchanged():
-    result = subprocess.run(
-        ["git", "diff", "--stat", "--", "app.py", "app_logic.py"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert result.stdout.strip() == ""
+# A former test_git_diff_confirms_app_py_and_app_logic_unchanged asserted
+# `git diff -- app.py app_logic.py` was empty. That was a one-time Slice 21
+# process check, not a repository invariant: its result depended on
+# working-tree state, and Action Boundary P2 intentionally adds explicit
+# Operations registration to app.py. The durable invariant -- the agent loop
+# never depends on app/app_logic -- is enforced structurally above by
+# test_agent_loop_script_never_imports_app_or_app_logic and
+# test_app_py_is_not_imported_by_agent_loop_or_agent_proposal.
