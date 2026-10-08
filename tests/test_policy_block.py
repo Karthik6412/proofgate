@@ -297,6 +297,8 @@ def test_operations_ruleset_evaluates_broad_context_in_rule_order():
         "valid rollback proof",
         "workflow impact within 100 rows",
     ]
+    # Operations rules attach no details; the generic field stays unused.
+    assert all(outcome.details is None for outcome in decision.outcomes)
 
 
 def test_pristine_db_rejected_as_mutation_target():

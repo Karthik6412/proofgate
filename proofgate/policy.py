@@ -14,7 +14,7 @@ compatibility; both are explanatory only and never affect the verdict.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Generic, Literal, Protocol, TypeVar
+from typing import Callable, Generic, Literal, Mapping, Protocol, TypeVar
 
 from proofgate.models import (
     ImpactEnvelope,
@@ -42,28 +42,39 @@ class RuleOutcome:
     evaluation -- its TriggeredRule and, when the domain defines one, the
     requirement whose absence made it fire -- so triggered rules and
     missing requirements can never come from separate conditions.
+
+    details is optional machine-readable evidence from the same
+    evaluation, on a passing or a failing outcome. Its keys and meaning
+    belong entirely to the domain that defines the rule; the engine never
+    reads, validates or interprets it, and it never affects the verdict.
     """
 
     rule_id: str
     triggered_rule: TriggeredRule | None = None
     missing_requirement: str | None = None
+    details: Mapping[str, object] | None = None
 
     @property
     def triggered(self) -> bool:
         return self.triggered_rule is not None
 
     @classmethod
-    def passed(cls, rule_id: str) -> "RuleOutcome":
-        return cls(rule_id=rule_id)
+    def passed(cls, rule_id: str, details: Mapping[str, object] | None = None) -> "RuleOutcome":
+        return cls(rule_id=rule_id, details=details)
 
     @classmethod
     def failed(
-        cls, rule_id: str, explanation: str, missing_requirement: str | None = None
+        cls,
+        rule_id: str,
+        explanation: str,
+        missing_requirement: str | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> "RuleOutcome":
         return cls(
             rule_id=rule_id,
             triggered_rule=TriggeredRule(rule_id=rule_id, explanation=explanation),
             missing_requirement=missing_requirement,
+            details=details,
         )
 
 

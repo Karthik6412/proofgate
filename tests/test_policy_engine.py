@@ -159,6 +159,52 @@ def test_rule_returning_another_rules_outcome_is_rejected():
         evaluate_policy(ToyContext(temperature=0, label="approved"), RuleSet(rules=(MislabeledRule(),)))
 
 
+@dataclass(frozen=True)
+class DetailedThresholdRule:
+    """Toy rule that attaches its own toy-defined detail keys."""
+
+    rule_id: str = "TOY_DETAILED"
+    limit: int = 10
+
+    def evaluate(self, context: ToyContext, /) -> RuleOutcome:
+        details = {"limit": self.limit, "observed": context.temperature}
+        if context.temperature > self.limit:
+            return RuleOutcome.failed(self.rule_id, "Too hot.", "cooler", details=details)
+        return RuleOutcome.passed(self.rule_id, details=details)
+
+
+def test_details_are_carried_unchanged_on_passing_and_failing_outcomes():
+    ruleset: RuleSet[ToyContext] = RuleSet(rules=(DetailedThresholdRule(),))
+
+    passing = evaluate_policy(ToyContext(temperature=5, label="approved"), ruleset)
+    failing = evaluate_policy(ToyContext(temperature=15, label="approved"), ruleset)
+
+    assert passing.outcomes[0].details == {"limit": 10, "observed": 5}
+    assert failing.outcomes[0].details == {"limit": 10, "observed": 15}
+
+
+def test_details_never_change_the_derived_outputs():
+    with_details = evaluate_policy(
+        ToyContext(temperature=15, label="approved"), RuleSet(rules=(DetailedThresholdRule(),))
+    )
+    without_details = PolicyDecision(outcomes=(RuleOutcome.failed("TOY_DETAILED", "Too hot.", "cooler"),))
+
+    assert with_details.verdict == without_details.verdict == "BLOCK"
+    assert with_details.triggered_rules == without_details.triggered_rules
+    assert with_details.missing_requirements == without_details.missing_requirements == ["cooler"]
+
+
+def test_details_default_to_none():
+    assert RuleOutcome.passed("TOY").details is None
+    assert RuleOutcome.failed("TOY", "x").details is None
+
+
+def test_triggered_rule_schema_does_not_gain_details():
+    outcome = RuleOutcome.failed("TOY", "x", details={"k": "v"})
+
+    assert outcome.triggered_rule.model_dump() == {"rule_id": "TOY", "explanation": "x"}
+
+
 def test_unknown_impact_decision_fails_closed_with_only_that_rule():
     decision = unknown_impact_decision("Impact is unknown.", "known impact")
 
@@ -288,6 +334,15 @@ def test_policy_module_exposes_exactly_the_four_rule_ids():
         "RULE_UNKNOWN_IMPACT",
         "RULE_WORKFLOW_BUDGET",
     }
+
+
+def test_engine_never_reads_outcome_details():
+    """details belongs to the domain: no generic definition other than
+    RuleOutcome itself (which declares and constructs it) may read it."""
+    definitions = _top_level_definitions(_policy_tree())
+    for name in GENERIC_ENGINE_DEFINITIONS - {"RuleOutcome"}:
+        attributes = {node.attr for node in ast.walk(definitions[name]) if isinstance(node, ast.Attribute)}
+        assert "details" not in attributes, name
 
 
 def test_operations_budget_constant_is_not_in_generic_policy():

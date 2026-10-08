@@ -1,9 +1,13 @@
-"""Shared selector canonicalization and hashing.
+"""Shared canonical JSON encoding and hashing.
 
-This is the single canonicalization function required by AGENTS.md's
-Selector Hash Contract. Every module that needs a selector hash (impact
-preview, snapshot creation, proof validation, guarded execution) must
-import from here rather than reimplementing canonical JSON encoding.
+canonical_json is the single canonical encoding in ProofGate, and
+sha256_digest hashes it. canonical_selector_json is the selector-specific
+use required by AGENTS.md's Selector Hash Contract: it filters to the
+mutation-selecting fields and then uses canonical_json, so every selector
+hash is byte-identical to the encoding it has always had. Every module
+that needs a selector hash (impact preview, snapshot creation, proof
+validation, guarded execution) or any other canonical digest must import
+from here rather than reimplementing canonical JSON encoding.
 """
 
 import hashlib
@@ -20,15 +24,31 @@ import json
 SELECTOR_FIELDS = ("inactive_days", "environment", "flag_name", "enabled", "rollout_percentage")
 
 
-def canonical_selector_json(arguments: dict) -> bytes:
-    """Canonical JSON encoding of selector arguments as UTF-8 bytes."""
-    selector = {key: arguments[key] for key in SELECTOR_FIELDS if key in arguments}
+def canonical_json(value: object) -> bytes:
+    """Canonical JSON encoding of value as UTF-8 bytes.
+
+    Encodes the whole value -- nothing is filtered. Values JSON cannot
+    represent (sets, datetimes, arbitrary objects) raise TypeError rather
+    than being converted, so callers must normalize them explicitly
+    (e.g. sorted lists, ISO-8601 strings) before hashing.
+    """
     return json.dumps(
-        selector,
+        value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
+
+
+def sha256_digest(value: object) -> str:
+    """SHA-256 hex digest of canonical_json(value)."""
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def canonical_selector_json(arguments: dict) -> bytes:
+    """Canonical JSON encoding of selector arguments as UTF-8 bytes."""
+    selector = {key: arguments[key] for key in SELECTOR_FIELDS if key in arguments}
+    return canonical_json(selector)
 
 
 def compute_selector_hash(arguments: dict) -> str:
