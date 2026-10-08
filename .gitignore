@@ -10,3 +10,4 @@ __pycache__/
 .DS_Store
 .env
 notes/log.md
+.vscode/
