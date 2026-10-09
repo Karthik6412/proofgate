@@ -16,6 +16,7 @@ import pytest
 
 import proofgate.bindings.legal.authorize as authorize_module
 from legal.models import AuthorityGrant
+from legal.permissions import SEEDED_AGENT_ID, SEEDED_USER_ID, get_agent_capabilities, get_permission_snapshot
 from proofgate.bindings.legal.authorize import (
     LegalAuthorizationAttempt,
     LegalAuthorizationStatus,
@@ -34,7 +35,17 @@ UTC = datetime.timezone.utc
 T0 = datetime.datetime(2026, 10, 9, 9, 0, tzinfo=UTC)
 EXPIRES = T0 + datetime.timedelta(hours=8)
 DURING = T0 + datetime.timedelta(hours=1)
+SNAPSHOT = get_permission_snapshot(SEEDED_USER_ID, captured_at=T0)
+CAPABILITIES = get_agent_capabilities(SEEDED_AGENT_ID)
 UNRESOLVABLE_PLAN = LegalPlan(steps=(PlanStep(step_id="s", tool="send_email", arguments={"to": "x@example.com"}),))
+
+
+def _authorize(grant, plan, **kwargs):
+    """The seeded permission snapshot and agent capabilities, which permit
+    every L3 scenario here, so these tests keep exercising L3 behavior."""
+    return authorize_legal_plan(
+        grant, plan, permission_snapshot=SNAPSHOT, agent_capabilities=CAPABILITIES, **kwargs
+    )
 
 
 def _grant() -> AuthorityGrant:
@@ -73,7 +84,7 @@ def _statuses(attempt: LegalAuthorizationAttempt) -> dict[str, str]:
 
 def test_valid_grant_canonical_plan_blocks_on_three_rules(spies):
     resolve_spy, rules_spy = spies
-    attempt = authorize_legal_plan(_grant(), CANONICAL_PLAN, now=DURING)
+    attempt = _authorize(_grant(), CANONICAL_PLAN, now=DURING)
 
     assert attempt.status is LegalAuthorizationStatus.EVALUATED
     assert attempt.verdict == "BLOCK"
@@ -91,7 +102,7 @@ def test_valid_grant_canonical_plan_blocks_on_three_rules(spies):
 
 def test_valid_grant_clean_plan_allows(spies):
     resolve_spy, rules_spy = spies
-    attempt = authorize_legal_plan(_grant(), CLEAN_PLAN, now=DURING)
+    attempt = _authorize(_grant(), CLEAN_PLAN, now=DURING)
 
     assert attempt.status is LegalAuthorizationStatus.EVALUATED
     assert attempt.verdict == "ALLOW"
@@ -103,7 +114,7 @@ def test_valid_grant_clean_plan_allows(spies):
 
 def test_committed_ids_reach_the_budget_rule():
     committed = tuple(f"D-102-{number:03d}" for number in range(501, 522))  # 21 disjoint + 80 = 101
-    attempt = authorize_legal_plan(_grant(), CLEAN_PLAN, now=DURING, committed_resource_ids=committed)
+    attempt = _authorize(_grant(), CLEAN_PLAN, now=DURING, committed_resource_ids=committed)
 
     assert attempt.verdict == "BLOCK"
     assert [rule.rule_id for rule in attempt.decision.triggered_rules] == [RULE_WORKFLOW_BUDGET]
@@ -116,7 +127,7 @@ def test_committed_ids_reach_the_budget_rule():
 
 def test_missing_grant_fails_closed_before_resolution(spies):
     resolve_spy, rules_spy = spies
-    attempt = authorize_legal_plan(None, CLEAN_PLAN, now=DURING)
+    attempt = _authorize(None, CLEAN_PLAN, now=DURING)
 
     assert attempt.status is LegalAuthorizationStatus.GRANT_MISSING
     assert attempt.reason == "grant_missing"
@@ -128,7 +139,7 @@ def test_missing_grant_fails_closed_before_resolution(spies):
 
 def test_expired_grant_fails_closed_before_resolution(spies):
     resolve_spy, rules_spy = spies
-    attempt = authorize_legal_plan(_grant(), CLEAN_PLAN, now=EXPIRES + datetime.timedelta(minutes=1))
+    attempt = _authorize(_grant(), CLEAN_PLAN, now=EXPIRES + datetime.timedelta(minutes=1))
 
     assert attempt.status is LegalAuthorizationStatus.GRANT_EXPIRED
     assert attempt.reason == "grant_expired"
@@ -140,7 +151,7 @@ def test_expired_grant_fails_closed_before_resolution(spies):
 
 def test_future_dated_grant_fails_closed_before_resolution(spies):
     resolve_spy, rules_spy = spies
-    attempt = authorize_legal_plan(_grant(), CLEAN_PLAN, now=T0 - datetime.timedelta(minutes=1))
+    attempt = _authorize(_grant(), CLEAN_PLAN, now=T0 - datetime.timedelta(minutes=1))
 
     assert attempt.status is LegalAuthorizationStatus.GRANT_NOT_YET_VALID
     assert attempt.reason == "grant_not_yet_valid"
@@ -162,28 +173,28 @@ def test_future_dated_grant_fails_closed_before_resolution(spies):
     ids=["before_granted_at", "at_granted_at", "inside", "just_before_expiry", "at_expires_at"],
 )
 def test_authority_is_in_effect_exactly_during_granted_at_to_expires_at(now, status):
-    attempt = authorize_legal_plan(_grant(), CLEAN_PLAN, now=now)
+    attempt = _authorize(_grant(), CLEAN_PLAN, now=now)
 
     assert attempt.status is status
     assert attempt.verdict == ("ALLOW" if status is LegalAuthorizationStatus.EVALUATED else "BLOCK")
 
 
 def test_expired_grant_blocks_even_a_plan_whose_rules_would_all_pass():
-    assert authorize_legal_plan(_grant(), CLEAN_PLAN, now=DURING).verdict == "ALLOW"
-    assert authorize_legal_plan(_grant(), CLEAN_PLAN, now=EXPIRES).verdict == "BLOCK"
+    assert _authorize(_grant(), CLEAN_PLAN, now=DURING).verdict == "ALLOW"
+    assert _authorize(_grant(), CLEAN_PLAN, now=EXPIRES).verdict == "BLOCK"
 
 
 def test_expiry_boundary():
-    assert authorize_legal_plan(_grant(), CLEAN_PLAN, now=EXPIRES).status is LegalAuthorizationStatus.GRANT_EXPIRED
+    assert _authorize(_grant(), CLEAN_PLAN, now=EXPIRES).status is LegalAuthorizationStatus.GRANT_EXPIRED
     just_before = EXPIRES - datetime.timedelta(microseconds=1)
-    assert authorize_legal_plan(_grant(), CLEAN_PLAN, now=just_before).status is LegalAuthorizationStatus.EVALUATED
+    assert _authorize(_grant(), CLEAN_PLAN, now=just_before).status is LegalAuthorizationStatus.EVALUATED
 
 
 def test_grant_failures_never_use_unknown_impact():
     for attempt in (
-        authorize_legal_plan(None, CLEAN_PLAN, now=DURING),
-        authorize_legal_plan(_grant(), CLEAN_PLAN, now=T0 - datetime.timedelta(seconds=1)),
-        authorize_legal_plan(_grant(), CLEAN_PLAN, now=EXPIRES),
+        _authorize(None, CLEAN_PLAN, now=DURING),
+        _authorize(_grant(), CLEAN_PLAN, now=T0 - datetime.timedelta(seconds=1)),
+        _authorize(_grant(), CLEAN_PLAN, now=EXPIRES),
     ):
         assert attempt.decision is None  # no PolicyDecision, so no RULE_UNKNOWN_IMPACT
 
@@ -220,7 +231,7 @@ def test_authorization_module_never_reads_a_clock():
 
 def test_naive_now_is_rejected():
     with pytest.raises(ValueError):
-        authorize_legal_plan(_grant(), CLEAN_PLAN, now=datetime.datetime(2026, 10, 9, 10, 0))
+        _authorize(_grant(), CLEAN_PLAN, now=datetime.datetime(2026, 10, 9, 10, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +241,7 @@ def test_naive_now_is_rejected():
 
 def test_resolution_failure_fails_closed_with_unknown_impact(spies):
     resolve_spy, rules_spy = spies
-    attempt = authorize_legal_plan(_grant(), UNRESOLVABLE_PLAN, now=DURING)
+    attempt = _authorize(_grant(), UNRESOLVABLE_PLAN, now=DURING)
 
     assert attempt.status is LegalAuthorizationStatus.RESOLUTION_FAILED
     assert attempt.verdict == "BLOCK"
@@ -258,12 +269,12 @@ def test_neither_precondition_is_a_legal_rule():
 
 def test_the_six_outcomes_are_observably_different():
     attempts = {
-        "missing": authorize_legal_plan(None, CANONICAL_PLAN, now=DURING),
-        "not_yet_valid": authorize_legal_plan(_grant(), CANONICAL_PLAN, now=T0 - datetime.timedelta(seconds=1)),
-        "expired": authorize_legal_plan(_grant(), CANONICAL_PLAN, now=EXPIRES),
-        "unresolvable": authorize_legal_plan(_grant(), UNRESOLVABLE_PLAN, now=DURING),
-        "known_block": authorize_legal_plan(_grant(), CANONICAL_PLAN, now=DURING),
-        "allow": authorize_legal_plan(_grant(), CLEAN_PLAN, now=DURING),
+        "missing": _authorize(None, CANONICAL_PLAN, now=DURING),
+        "not_yet_valid": _authorize(_grant(), CANONICAL_PLAN, now=T0 - datetime.timedelta(seconds=1)),
+        "expired": _authorize(_grant(), CANONICAL_PLAN, now=EXPIRES),
+        "unresolvable": _authorize(_grant(), UNRESOLVABLE_PLAN, now=DURING),
+        "known_block": _authorize(_grant(), CANONICAL_PLAN, now=DURING),
+        "allow": _authorize(_grant(), CLEAN_PLAN, now=DURING),
     }
 
     def signature(attempt):
@@ -293,11 +304,11 @@ def test_the_six_outcomes_are_observably_different():
 
 def test_attempts_are_deterministic():
     for plan in (CANONICAL_PLAN, CLEAN_PLAN, UNRESOLVABLE_PLAN):
-        assert authorize_legal_plan(_grant(), plan, now=DURING) == authorize_legal_plan(_grant(), plan, now=DURING)
+        assert _authorize(_grant(), plan, now=DURING) == _authorize(_grant(), plan, now=DURING)
 
 
 def test_attempt_is_immutable():
-    attempt = authorize_legal_plan(_grant(), CANONICAL_PLAN, now=DURING)
+    attempt = _authorize(_grant(), CANONICAL_PLAN, now=DURING)
 
     with pytest.raises(AttributeError):
         attempt.status = LegalAuthorizationStatus.EVALUATED

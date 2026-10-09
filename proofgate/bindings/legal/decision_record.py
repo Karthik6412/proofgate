@@ -26,7 +26,7 @@ from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, field_serializer
 
-from legal.models import AuthorityGrant, Document, PermissionSnapshot
+from legal.models import AgentCapabilities, AuthorityGrant, Document, PermissionSnapshot
 from proofgate.audit import append_jsonl
 from proofgate.bindings.legal.authorization import (
     AuthorizationRecord,
@@ -177,7 +177,8 @@ def authorize_and_record(
     plan: LegalPlan,
     *,
     now: datetime.datetime,
-    permission_snapshot: PermissionSnapshot,
+    permission_snapshot: PermissionSnapshot | None,
+    agent_capabilities: AgentCapabilities | None,
     committed_resource_ids: tuple[str, ...] = (),
     documents: Mapping[str, Document] | None = None,
     decision_log_path: Path | None = None,
@@ -194,6 +195,7 @@ def authorize_and_record(
         plan,
         now=now,
         permission_snapshot=permission_snapshot,
+        agent_capabilities=agent_capabilities,
         committed_resource_ids=committed_resource_ids,
         documents=documents,
     )

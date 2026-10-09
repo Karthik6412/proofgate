@@ -42,7 +42,7 @@ from typing import Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict
 
-from legal.models import AuthorityGrant, Document, PermissionSnapshot
+from legal.models import AgentCapabilities, AuthorityGrant, Document, PermissionSnapshot
 from proofgate.bindings.legal.authorize import LegalAuthorizationAttempt, authorize_legal_plan
 from proofgate.bindings.legal.plan import LegalPlan
 from proofgate.bindings.legal.resolver import LegalResolvedEffect
@@ -153,15 +153,23 @@ def authorize_and_bind(
     plan: LegalPlan,
     *,
     now: datetime.datetime,
-    permission_snapshot: PermissionSnapshot,
+    permission_snapshot: PermissionSnapshot | None,
+    agent_capabilities: AgentCapabilities | None,
     committed_resource_ids: tuple[str, ...] = (),
     documents: Mapping[str, Document] | None = None,
 ) -> tuple[LegalAuthorizationAttempt, AuthorizationRecord | None]:
-    """Authorize with L3 unchanged; on ALLOW, mint a record bound to the
-    very grant, plan and resolved effect that were just authorized. Any
-    other outcome yields no record."""
+    """Authorize; on ALLOW, mint a record bound to the very grant, plan,
+    resolved effect and permission snapshot that were just authorized. Any
+    other outcome yields no record. Agent capabilities gate authorization
+    but are not part of the action digest."""
     attempt = authorize_legal_plan(
-        grant, plan, now=now, committed_resource_ids=committed_resource_ids, documents=documents
+        grant,
+        plan,
+        now=now,
+        permission_snapshot=permission_snapshot,
+        agent_capabilities=agent_capabilities,
+        committed_resource_ids=committed_resource_ids,
+        documents=documents,
     )
     if attempt.verdict != "ALLOW":
         return attempt, None

@@ -1,19 +1,24 @@
-"""Seeded local permission provider.
+"""Seeded local permission and agent-capability providers.
 
 Stands in for the firm's IAM / ethical-wall source, which stays
 authoritative in a real deployment; this layer only reads its state. No
 network, no external API, no model call. Restricted documents are a
 coarse permission-layer fact here, not an Action Boundary rule.
+
+Agent tool capabilities are a separate, static seeded fixture: they are
+not part of the user's PermissionSnapshot.
 """
 
 import datetime
 
 from legal.corpus import CANONICAL_MATTER, EXPANSION_MATTER, build_corpus
-from legal.models import PermissionSnapshot
+from legal.models import AgentCapabilities, PermissionSnapshot
 
 SEEDED_USER_ID = "associate-01"
 SEEDED_SOURCE_VERSION = "seed-v1"
 SEEDED_PERMITTED_RECIPIENTS = frozenset({"counsel@example.com"})
+SEEDED_AGENT_ID = "agent-01"
+SEEDED_AGENT_TOOLS = frozenset({"search_documents", "compile_package", "share_package"})
 
 
 def get_permission_snapshot(user_id: str, captured_at: datetime.datetime) -> PermissionSnapshot | None:
@@ -34,3 +39,10 @@ def get_permission_snapshot(user_id: str, captured_at: datetime.datetime) -> Per
         source_version=SEEDED_SOURCE_VERSION,
         captured_at=captured_at,
     )
+
+
+def get_agent_capabilities(agent_id: str) -> AgentCapabilities | None:
+    """The seeded capabilities for the one seeded agent, or None for anyone else."""
+    if agent_id != SEEDED_AGENT_ID:
+        return None
+    return AgentCapabilities(agent_id=agent_id, allowed_tools=SEEDED_AGENT_TOOLS)

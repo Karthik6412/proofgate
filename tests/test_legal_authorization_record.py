@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 import proofgate.bindings.legal.authorization as authorization_module
 from legal.models import AuthorityGrant
-from legal.permissions import SEEDED_USER_ID, get_permission_snapshot
+from legal.permissions import SEEDED_AGENT_ID, SEEDED_USER_ID, get_agent_capabilities, get_permission_snapshot
 from proofgate.bindings.legal.authorization import (
     AuthorizationDigestMismatch,
     AuthorizationRecord,
@@ -52,12 +52,16 @@ def _grant(**overrides) -> AuthorityGrant:
     return AuthorityGrant(**fields)
 
 
+def _capabilities():
+    return get_agent_capabilities(SEEDED_AGENT_ID)
+
+
 def _snapshot(captured_at=T0):
     return get_permission_snapshot(SEEDED_USER_ID, captured_at=captured_at)
 
 
 def _bind(plan=CLEAN_PLAN, grant=None):
-    return authorize_and_bind(grant or _grant(), plan, now=NOW, permission_snapshot=_snapshot())
+    return authorize_and_bind(grant or _grant(), plan, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
 
 
 def _authorized_action() -> tuple[AuthorizationRecord, LegalAction]:
@@ -209,9 +213,9 @@ def test_allow_mints_a_record_bound_to_the_authorized_action():
 
 
 def test_issue_time_is_not_part_of_the_digest():
-    _, early = authorize_and_bind(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot())
+    _, early = authorize_and_bind(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
     _, late = authorize_and_bind(
-        _grant(), CLEAN_PLAN, now=NOW + datetime.timedelta(hours=2), permission_snapshot=_snapshot()
+        _grant(), CLEAN_PLAN, now=NOW + datetime.timedelta(hours=2), permission_snapshot=_snapshot(), agent_capabilities=_capabilities()
     )
 
     assert early.action_digest == late.action_digest
@@ -234,7 +238,7 @@ def test_issue_time_is_not_part_of_the_digest():
 )
 def test_anything_but_allow_mints_no_record(grant, plan, status):
     grants = {"valid": _grant(), "expired": _grant(expires_at=T0 + datetime.timedelta(minutes=30)), None: None}
-    attempt, record = authorize_and_bind(grants[grant], plan, now=NOW, permission_snapshot=_snapshot())
+    attempt, record = authorize_and_bind(grants[grant], plan, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
 
     assert attempt.status is status
     assert attempt.verdict == "BLOCK"

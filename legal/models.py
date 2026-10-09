@@ -139,3 +139,14 @@ class PermissionSnapshot(BaseModel):
     @property
     def snapshot_digest(self) -> str:
         return sha256_digest(self.canonical_state())
+
+
+class AgentCapabilities(BaseModel):
+    """Which tools one agent may call. Deliberately separate from
+    PermissionSnapshot: user permissions come from IAM / the ethical wall,
+    agent tool capabilities do not. A static, trusted input in Friday v1."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    agent_id: str = Field(min_length=1)
+    allowed_tools: frozenset[str]

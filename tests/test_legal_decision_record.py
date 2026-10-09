@@ -19,7 +19,7 @@ from pydantic import ValidationError
 import proofgate.audit as audit_module
 import proofgate.bindings.legal.decision_record as decision_module
 from legal.models import AuthorityGrant
-from legal.permissions import SEEDED_USER_ID, get_permission_snapshot
+from legal.permissions import SEEDED_AGENT_ID, SEEDED_USER_ID, get_agent_capabilities, get_permission_snapshot
 from proofgate.bindings.legal.authorization import LegalAction, action_digest, authorize_and_bind
 from proofgate.bindings.legal.authorize import LegalAuthorizationStatus
 from proofgate.bindings.legal.decision_record import (
@@ -65,6 +65,10 @@ def _grant(**overrides) -> AuthorityGrant:
     return AuthorityGrant(**fields)
 
 
+def _capabilities():
+    return get_agent_capabilities(SEEDED_AGENT_ID)
+
+
 def _snapshot():
     return get_permission_snapshot(SEEDED_USER_ID, captured_at=T0)
 
@@ -74,9 +78,14 @@ def _isolate_decision_log(tmp_path, monkeypatch):
     monkeypatch.setattr(decision_module, "DEFAULT_DECISION_LOG_PATH", tmp_path / "legal_decisions.jsonl")
 
 
-def _record(plan, path, grant=None):
+def _record(plan, path, grant=None, snapshot=None):
     return authorize_and_record(
-        grant or _grant(), plan, now=NOW, permission_snapshot=_snapshot(), decision_log_path=path
+        grant or _grant(),
+        plan,
+        now=NOW,
+        permission_snapshot=snapshot or _snapshot(),
+        agent_capabilities=_capabilities(),
+        decision_log_path=path,
     )
 
 
@@ -183,7 +192,13 @@ def test_block_record_digest_names_the_exact_evaluated_action(tmp_path):
 
 
 def test_single_rule_block_marks_only_that_rule_failed(tmp_path):
-    attempt, authorization, record = _record(OUTSIDE_RECIPIENT_PLAN, tmp_path / "log.jsonl")
+    """The recipient is permitted by the permission snapshot (so the coarse
+    recipient check passes) but not by the grant (so the grant's recipient
+    boundary rule fails)."""
+    snapshot = _snapshot().model_copy(
+        update={"permitted_recipients": frozenset({"counsel@example.com", "outside@example.com"})}
+    )
+    attempt, authorization, record = _record(OUTSIDE_RECIPIENT_PLAN, tmp_path / "log.jsonl", snapshot=snapshot)
     payload = json.loads(_lines(tmp_path / "log.jsonl")[0])
 
     assert authorization is None
@@ -226,7 +241,7 @@ def test_check_details_carry_each_outcomes_own_details(tmp_path):
 
 
 def test_build_uses_existing_objects_without_resolving_or_evaluating():
-    attempt, authorization = authorize_and_bind(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot())
+    attempt, authorization = authorize_and_bind(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
     with mock.patch("proofgate.bindings.legal.resolver.resolve_plan") as resolve_spy, mock.patch(
         "proofgate.bindings.legal.rules.evaluate_legal_rules"
     ) as rules_spy:
@@ -284,7 +299,7 @@ def test_pre_decision_failures_write_no_record(tmp_path, grant, plan, status):
     }
     log = tmp_path / "log.jsonl"
     attempt, authorization, record = authorize_and_record(
-        grants[grant], plan, now=NOW, permission_snapshot=_snapshot(), decision_log_path=log
+        grants[grant], plan, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities(), decision_log_path=log
     )
 
     assert attempt.status is status
@@ -293,7 +308,7 @@ def test_pre_decision_failures_write_no_record(tmp_path, grant, plan, status):
 
 
 def test_build_refuses_an_attempt_that_was_not_evaluated():
-    attempt, _ = authorize_and_bind(None, CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot())
+    attempt, _ = authorize_and_bind(None, CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
 
     with pytest.raises(ValueError, match="not evaluated"):
         build_decision_record(_grant(), attempt, "0" * 64)
@@ -319,7 +334,7 @@ def test_second_write_appends_and_preserves_the_first_line_exactly(tmp_path):
 
 
 def test_default_log_is_separate_from_the_operations_audit_log():
-    _, _, record = authorize_and_record(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot())
+    _, _, record = authorize_and_record(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
 
     default_log = decision_module.DEFAULT_DECISION_LOG_PATH
     assert json.loads(_lines(default_log)[0])["decision_id"] == record.decision_id
@@ -330,7 +345,7 @@ def test_default_log_is_separate_from_the_operations_audit_log():
 def test_append_never_truncates_existing_content(tmp_path):
     log = tmp_path / "log.jsonl"
     log.write_text('{"pre-existing": true}\n', encoding="utf-8")
-    attempt, authorization = authorize_and_bind(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot())
+    attempt, authorization = authorize_and_bind(_grant(), CLEAN_PLAN, now=NOW, permission_snapshot=_snapshot(), agent_capabilities=_capabilities())
 
     append_decision_record(build_decision_record(_grant(), attempt, authorization.action_digest), log)
 
