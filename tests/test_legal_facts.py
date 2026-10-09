@@ -406,6 +406,93 @@ def test_legal_facts_contain_no_decision_or_resolver_concepts():
         assert not names & forbidden, path.name
 
 
-def test_proofgate_never_imports_legal():
+REPO_ROOT = LEGAL_DIR.parent
+LEGAL_BINDING_DIR = PROOFGATE_DIR / "bindings" / "legal"
+
+
+def _module_name(path: Path) -> str:
+    parts = path.relative_to(REPO_ROOT).with_suffix("").parts
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+def _absolute_imports(source: str, module: str, is_package: bool) -> set[str]:
+    """Every module a source file imports, with relative imports resolved
+    and `from package import name` also recorded as `package.name`."""
+    package = module if is_package else module.rpartition(".")[0]
+    imported = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base_parts = package.split(".")[: len(package.split(".")) - (node.level - 1)]
+                base = ".".join(base_parts + ([node.module] if node.module else []))
+            else:
+                base = node.module or ""
+            imported.add(base)
+            imported.update(f"{base}.{alias.name}" for alias in node.names)
+    return imported
+
+
+def _legal_imports(source: str, module: str, is_package: bool = False) -> set[str]:
+    return {
+        name
+        for name in _absolute_imports(source, module, is_package)
+        if name == "legal"
+        or name.startswith("legal.")
+        or name == "proofgate.bindings.legal"
+        or name.startswith("proofgate.bindings.legal.")
+    }
+
+
+def test_only_the_legal_binding_imports_the_legal_domain():
+    """Only proofgate/bindings/legal/** may import legal or the Legal
+    binding. Everything else under proofgate/ -- generic code and the
+    Operations binding alike -- stays independent of Legal."""
+    checked = []
     for path in sorted(PROOFGATE_DIR.rglob("*.py")):
-        assert not {module for module in _imported_modules(path) if module.split(".")[0] == "legal"}, path.name
+        if LEGAL_BINDING_DIR == path.parent or LEGAL_BINDING_DIR in path.parents:
+            continue
+        checked.append(path)
+        found = _legal_imports(path.read_text(), _module_name(path), path.name == "__init__.py")
+        assert not found, f"{path.relative_to(REPO_ROOT)} imports {sorted(found)}"
+
+    checked_names = {path.relative_to(PROOFGATE_DIR).as_posix() for path in checked}
+    assert {"bindings/operations.py", "bindings/__init__.py", "core.py", "policy.py", "registry.py"} <= checked_names
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import legal",
+        "import legal.models",
+        "from legal.corpus import build_corpus",
+        "from legal import corpus",
+        "import proofgate.bindings.legal.resolver",
+        "from proofgate.bindings.legal.resolver import resolve_plan",
+        "from proofgate.bindings import legal",
+        "from .legal import resolver",
+        "from .legal.resolver import resolve_plan",
+        "from ..bindings.legal import plan",
+    ],
+)
+def test_boundary_check_catches_legal_imports_in_the_operations_binding(source):
+    """Positive control: each of these would be caught in
+    proofgate/bindings/operations.py."""
+    assert _legal_imports(source, "proofgate.bindings.operations")
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["import operations.actions", "from proofgate.registry import register_tool", "import legalese", "from . import operations"],
+)
+def test_boundary_check_ignores_non_legal_imports(source):
+    assert not _legal_imports(source, "proofgate.bindings.operations")
+
+
+def test_a_legal_import_added_to_the_real_operations_binding_is_caught():
+    path = PROOFGATE_DIR / "bindings" / "operations.py"
+    source = path.read_text()
+
+    assert not _legal_imports(source, _module_name(path))
+    assert _legal_imports(source + "\nfrom legal.models import Document\n", _module_name(path))
