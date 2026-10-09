@@ -346,8 +346,10 @@ def test_invalid_grants_are_rejected(override):
 def test_grant_validity():
     grant = _grant()
 
+    assert grant_validity(grant, now=T0 - datetime.timedelta(microseconds=1)) == GrantValidity.NOT_YET_VALID
     assert grant_validity(grant, now=T0) == GrantValidity.VALID
     assert grant_validity(grant, now=T0 + datetime.timedelta(hours=7, minutes=59)) == GrantValidity.VALID
+    assert grant_validity(grant, now=grant.expires_at - datetime.timedelta(microseconds=1)) == GrantValidity.VALID
     assert grant_validity(grant, now=grant.expires_at) == GrantValidity.EXPIRED
     assert grant_validity(None, now=T0) == GrantValidity.MISSING
     with pytest.raises(ValueError):
