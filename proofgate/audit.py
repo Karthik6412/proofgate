@@ -13,6 +13,8 @@ import datetime
 import uuid
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from proofgate.models import AuditEvent
 
 SCHEMA_VERSION = "v1"
@@ -28,15 +30,20 @@ def current_timestamp() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def append_audit_event(event: AuditEvent, audit_path: Path | None = None) -> None:
-    """Append exactly one JSON line. Never overwrites existing events."""
-    path = Path(audit_path) if audit_path is not None else DEFAULT_AUDIT_PATH
+def append_jsonl(record: BaseModel, path: Path) -> None:
+    """Append one model as exactly one JSON line. Never overwrites."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("a", encoding="utf-8") as f:
-        f.write(event.model_dump_json())
+        f.write(record.model_dump_json())
         f.write("\n")
         f.flush()
+
+
+def append_audit_event(event: AuditEvent, audit_path: Path | None = None) -> None:
+    """Append exactly one JSON line. Never overwrites existing events."""
+    append_jsonl(event, Path(audit_path) if audit_path is not None else DEFAULT_AUDIT_PATH)
 
 
 def reset_audit_log(audit_path: Path | None = None) -> None:

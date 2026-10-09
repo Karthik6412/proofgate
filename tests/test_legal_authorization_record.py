@@ -8,6 +8,7 @@ timezones, snapshot capture time, reads, issue time) do not change it.
 
 import ast
 import datetime
+import inspect
 from pathlib import Path
 from unittest import mock
 
@@ -371,3 +372,49 @@ def test_authorization_module_has_no_l5_concepts():
 
     for concept in ("approval", "outbox", "dispatch", "execute", "postcondition", "rollback", "require_approval"):
         assert not any(concept in identifier for identifier in lowered), concept
+
+
+# ---------------------------------------------------------------------------
+# Record expiry (stored, not enforced)
+# ---------------------------------------------------------------------------
+
+
+def test_record_expiry_is_the_grant_expiry():
+    grant = _grant(expires_at=T0 + datetime.timedelta(hours=3))
+    _, record = _bind(grant=grant)
+
+    assert record.expires_at == grant.expires_at == T0 + datetime.timedelta(hours=3)
+
+
+def test_record_expiry_is_immutable():
+    record, _ = _authorized_action()
+
+    with pytest.raises(ValidationError):
+        record.expires_at = record.expires_at + datetime.timedelta(days=365)
+
+
+def test_record_expiry_is_not_part_of_the_digest():
+    _, short = _bind(grant=_grant())
+    record, _ = _authorized_action()
+
+    assert short.action_digest == record.action_digest == PINNED_CLEAN_DIGEST
+
+
+def test_expiry_is_not_enforced_by_verification():
+    """Expiry enforcement belongs to the (continuation-scope) execution
+    sequence: verification takes no time and checks only the digest."""
+    record, action = _authorized_action()
+
+    assert "now" not in inspect.signature(verify_authorization).parameters
+    verify_authorization(record, action)
+
+
+def test_authorization_module_reads_no_clock():
+    tree = ast.parse(Path(authorization_module.__file__).read_text())
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert not called & {"now", "utcnow", "today", "time", "monotonic"}

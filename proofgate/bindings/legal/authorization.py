@@ -62,7 +62,9 @@ class LegalAction(BaseModel):
 
 class AuthorizationRecord(BaseModel):
     """The fact that one exact action was authorized. Only an ALLOW can
-    produce one."""
+    produce one. expires_at is the grant's own expiry -- no second TTL --
+    and is stored, not enforced: checking it belongs to the execution
+    sequence, which is continuation scope."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -74,6 +76,7 @@ class AuthorizationRecord(BaseModel):
     verdict: Literal["ALLOW"]
     evaluated_rule_ids: tuple[str, ...]
     issued_at: datetime.datetime
+    expires_at: datetime.datetime
 
 
 class AuthorizationDigestMismatch(Exception):
@@ -174,6 +177,7 @@ def authorize_and_bind(
         verdict="ALLOW",
         evaluated_rule_ids=tuple(outcome.rule_id for outcome in attempt.decision.outcomes),
         issued_at=now,
+        expires_at=grant.expires_at,
     )
     return attempt, record
 
