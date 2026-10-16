@@ -238,6 +238,9 @@ Action Boundary v1 **stops at authorization**.
 - **Pre-policy failures have no decision record.** Grant, permission-state
   and resolution failures are reported by the authorization attempt's
   status, not in the Legal JSON decision-record schema.
+- **A digest mismatch is not audited.** `verify_authorization` raises
+  `AuthorizationDigestMismatch` naming the expected and actual digests, but
+  no record of the failed verification is written.
 - **Persistent budget state is not implemented.** Previously committed
   document IDs are supplied in memory by the caller.
 - **Synthetic sources.** The corpus, grants, permission snapshot and agent
