@@ -33,7 +33,6 @@ def _read(rel_path: str) -> str:
         "docs/architecture.md",
         "docs/trust-model.md",
         "docs/production-evolution.md",
-        "docs/interview-guide.md",
         "scripts/run_portfolio_demo.py",
         "scripts/verify_local_setup.py",
         ".env.example",
@@ -251,7 +250,6 @@ def test_readme_referenced_docs_exist_and_are_linked():
         "docs/trust-model.md",
         "THREAT_MODEL.md",
         "docs/production-evolution.md",
-        "docs/interview-guide.md",
         "DEMO.md",
     ):
         assert doc in readme, f"README does not reference {doc}"

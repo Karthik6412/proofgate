@@ -11,3 +11,5 @@ __pycache__/
 .env
 notes/log.md
 .vscode/
+# Private study notes, kept locally only.
+docs/interview-guide.md

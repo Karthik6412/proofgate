@@ -456,7 +456,7 @@ operations/         deterministic previews, mutations, snapshots, restoration
 agent/              model proposal and bounded repair (live-only, explicitly labeled)
 scripts/            deterministic demos and local verification
 tests/              offline deterministic regression suite
-docs/               specification, architecture, trust model, production evolution, interview guide
+docs/               specification, architecture, trust model, production evolution
 ```
 
 > Domain code (`legal/`, `operations/`) supplies facts or performs preview
@@ -542,7 +542,6 @@ policy-engine refactor left unchanged.
 - `docs/trust-model.md` -- what each component may and may not control
 - `THREAT_MODEL.md` -- protected assets, threats, mitigations, residual risk
 - `docs/production-evolution.md` -- plausible future phases, not implemented
-- `docs/interview-guide.md` -- explanation aids and an ownership checklist
 - `DEMO.md` -- exact click paths, per-slice detail, and every documented number
 
 ## Roadmap (not implemented)
